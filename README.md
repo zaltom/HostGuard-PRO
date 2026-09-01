@@ -345,4 +345,12 @@ Alongside Another Firewall* in `guide.md`.
 
 ------------------------------------------------------------------------
 
+## 🐝 Built By
+
+**Architected and developed by Fast Hive**
+
+Website: <https://fasthive.com>
+
+------------------------------------------------------------------------
+
 Secure your infrastructure, React instantly.

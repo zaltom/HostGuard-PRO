@@ -95,6 +95,13 @@ body {
   display: flex; align-items: center; justify-content: space-between;
 }
 
+.sidebar-credit {
+  padding: 0 20px 14px; font-size: 11px; line-height: 1.5;
+  color: var(--muted);
+}
+.sidebar-credit a { color: inherit; text-decoration: underline; }
+.sidebar-credit a:hover { color: var(--text); }
+
 /* ---------- Main column ---------- */
 .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 

@@ -34,6 +34,8 @@ log_step()  { echo -e "${BLUE}[STEP]${NC} $1"; }
 echo ""
 echo "=============================================="
 echo "  HostGuard Pro v${VERSION} - Installer"
+echo "  Architected and developed by Fast Hive"
+echo "  https://fasthive.com"
 echo "=============================================="
 echo ""
 

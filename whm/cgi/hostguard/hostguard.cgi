@@ -1581,6 +1581,14 @@ sub _print_nav {
 
     my $ver = _h($HGConfig::VERSION || '1.0.0');
     print qq(<div class="sidebar-foot"><span>Version $ver</span></div>\n);
+
+    # Attribution. The only outbound link in the interface: one the admin
+    # chooses to follow, not an asset the page fetches, so the interface still
+    # renders with the machine offline. noopener/noreferrer keep the WHM session
+    # out of the opened tab's reach and out of the referrer.
+    print qq(<div class="sidebar-credit">Architected and developed by<br>)
+        . qq(<a href="https://fasthive.com" target="_blank")
+        . qq( rel="noopener noreferrer">Fast Hive</a></div>\n);
     print qq(</aside>\n);
 
     # --- main column, topbar ---

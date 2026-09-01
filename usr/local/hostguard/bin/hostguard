@@ -108,6 +108,8 @@ if ($action eq '-e' || $action eq '--enable') {
     cmd_status();
 } elsif ($action eq '-v' || $action eq '--version') {
     print "HostGuard Pro v$VERSION\n";
+    print "Architected and developed by Fast Hive\n";
+    print "https://fasthive.com\n";
 } elsif ($action eq '--start-daemon') {
     cmd_start_daemon();
 } elsif ($action eq '--stop-daemon') {
@@ -1278,6 +1280,9 @@ Patterns:      /etc/hostguard/patterns.conf
 Watched paths: /etc/hostguard/watch.conf
 Cluster:       /etc/hostguard/cluster.conf
 Logs:          /var/log/hostguard/daemon.log
+
+Architected and developed by Fast Hive
+https://fasthive.com
 
 EOF
 }
