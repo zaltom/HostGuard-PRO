@@ -1,0 +1,24 @@
+HostGuard Pro - Account Modified
+==================================
+
+Server:   [HOSTNAME]
+Time:     [TIME]
+
+Changes:  [COUNT]
+
+[CHANGES]
+
+Changes to the account database are reported field by field. A password
+change is reported as the fact that it changed; the hash itself is never
+stored or sent, so nothing in this message can be used against the
+account.
+
+Worth attention in particular:
+
+  a new account you did not create
+  a shell changed from nologin or false to a real one
+  a uid changed to 0, which makes the account root by another name
+  a home directory moved somewhere writable by others
+
+--
+HostGuard Pro - https://fasthive.com/

@@ -1,0 +1,20 @@
+HostGuard Pro - SSH Login
+==================================
+
+Server:   [HOSTNAME]
+Time:     [TIME]
+
+Account:  [USER]
+Address:  [IP]
+
+An SSH session was opened on this server and authentication succeeded.
+
+If this was you, nothing needs doing. If it was not, treat the account
+as compromised: change its credentials, review its authorized_keys, and
+check what the session did.
+
+To block the address immediately:
+  hostguard -d [IP] "unexpected SSH login"
+
+--
+HostGuard Pro - https://fasthive.com/

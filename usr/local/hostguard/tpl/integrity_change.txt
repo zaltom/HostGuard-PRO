@@ -1,0 +1,33 @@
+HostGuard Pro - System Binary Changed
+==================================
+
+Server:   [HOSTNAME]
+Time:     [TIME]
+
+Changes:  [COUNT]
+
+[CHANGES]
+
+A changed system binary is expected after a package update. If one was
+applied, this message is routine, and you can record the new state as
+the baseline with:
+
+  hostguard --integrity-reset
+
+If no update was applied, treat this as a compromise until you have
+explained it. Replacing ls, ps, netstat or sshd is how an intruder stays
+invisible to exactly the commands you would use to look for them, which
+means the output of those commands can no longer be trusted to answer
+the question.
+
+Check against the package manager, which reads its own database rather
+than the files:
+
+  rpm -Va                    # every changed packaged file
+  rpm -qf /path/to/binary    # which package owns one
+
+Do not run --integrity-reset to silence a report you have not explained.
+It discards the only record of what the binaries used to look like.
+
+--
+HostGuard Pro - https://fasthive.com/

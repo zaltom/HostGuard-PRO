@@ -1,0 +1,18 @@
+HostGuard Pro - su Activity
+==================================
+
+Server:   [HOSTNAME]
+Time:     [TIME]
+
+Event:    [TITLE]
+Detail:   [DETAIL]
+
+Log line:
+  [LOGLINE]
+
+A user switched, or tried to switch, to another account. A failed
+attempt from an account that has no reason to use su is worth looking
+at; a run of them is worth acting on.
+
+--
+HostGuard Pro - https://fasthive.com/

@@ -1,0 +1,1285 @@
+#!/usr/bin/perl
+###############################################################################
+# HostGuard Pro - CLI Tool
+# /usr/local/hostguard/bin/hostguard
+#
+# Command-line interface for managing the HostGuard Pro firewall and daemon.
+#
+# Usage:
+#   hostguard -e              Enable firewall
+#   hostguard -x              Disable firewall
+#   hostguard -r              Reload firewall rules
+#   hostguard -a <ip> [note]  Allow IP
+#   hostguard -d <ip> [note]  Deny/block IP
+#   hostguard -tr <ip>        Remove temporary block
+#   hostguard -g <ip>         Search/grep IP in rules and lists
+#   hostguard -l              List temporary blocks
+#   hostguard -b              Update external block lists
+#   hostguard -c              Update country zone files
+#   hostguard -ta <ip> [ttl]  Allow an IP temporarily
+#   hostguard -tar <ip>       Remove a temporary allow
+#   hostguard -la             List temporary allows
+#   hostguard -s              Show firewall status
+#   hostguard -v              Show version
+#   hostguard --security      Run the server security check
+#   hostguard --preset <name> Apply a security preset
+#   hostguard --scan          Run the process and file checks now
+#   hostguard --cluster ...   Send an action to the cluster
+#   hostguard --start-daemon  Start the login failure daemon
+#   hostguard --stop-daemon   Stop the login failure daemon
+###############################################################################
+use strict;
+use warnings;
+
+use lib '/usr/local/hostguard/lib';
+use HGConfig;
+use HGFirewall;
+use HGLogger;
+use HGBlocklist;
+use HGGeo;
+use HGSystem;
+use HGProcess;
+use HGWatch;
+use HGRelay;
+use HGCluster;
+
+my $VERSION = $HGConfig::VERSION;
+
+# Must run as root
+unless ($> == 0) {
+    die "Error: hostguard must be run as root.\n";
+}
+
+# Parse arguments
+my $action = shift @ARGV // '';
+# The TESTING-mode safety cron. Declared here because cmd_disable, cmd_status
+# and the cron management below all name it.
+my $TESTING_CRON = '/etc/cron.d/hostguard_testing';
+
+my $arg1   = shift @ARGV // '';
+my $arg2   = join(' ', @ARGV);
+
+# Initialize logger
+my $config = HGConfig->loadconfig();
+HGLogger->init(
+    file     => $config->get('LOG_FILE')     // '/var/log/hostguard/daemon.log',
+    level    => $config->get('LOG_LEVEL')    // 1,
+    max_size => $config->get('LOG_MAX_SIZE') // 0,
+);
+
+# Route to action
+if ($action eq '-e' || $action eq '--enable') {
+    cmd_enable();
+} elsif ($action eq '-x' || $action eq '--disable') {
+    cmd_disable();
+} elsif ($action eq '-r' || $action eq '--reload' || $action eq '--restart') {
+    cmd_reload();
+} elsif ($action eq '-a' || $action eq '--allow') {
+    cmd_allow($arg1, $arg2);
+} elsif ($action eq '-d' || $action eq '--deny') {
+    cmd_deny($arg1, $arg2);
+} elsif ($action eq '-tr' || $action eq '--temp-remove' || $action eq '--unblock') {
+    cmd_tempremove($arg1);
+} elsif ($action eq '-g' || $action eq '--grep') {
+    cmd_grep($arg1);
+} elsif ($action eq '-l' || $action eq '--list') {
+    cmd_list();
+} elsif ($action eq '-b' || $action eq '--blocklists') {
+    cmd_blocklists($arg1);
+} elsif ($action eq '-c' || $action eq '--countries') {
+    cmd_countries($arg1);
+} elsif ($action eq '-ta' || $action eq '--temp-allow') {
+    cmd_tempallow($arg1, $arg2);
+} elsif ($action eq '-tar' || $action eq '--temp-allow-remove') {
+    cmd_tempallow_remove($arg1);
+} elsif ($action eq '-la' || $action eq '--list-allows') {
+    cmd_list_allows();
+} elsif ($action eq '--security') {
+    cmd_security();
+} elsif ($action eq '--preset') {
+    cmd_preset($arg1);
+} elsif ($action eq '--scan') {
+    cmd_scan();
+} elsif ($action eq '--integrity-reset') {
+    cmd_integrity_reset();
+} elsif ($action eq '--cluster') {
+    cmd_cluster($arg1, $arg2);
+} elsif ($action eq '-s' || $action eq '--status') {
+    cmd_status();
+} elsif ($action eq '-v' || $action eq '--version') {
+    print "HostGuard Pro v$VERSION\n";
+} elsif ($action eq '--start-daemon') {
+    cmd_start_daemon();
+} elsif ($action eq '--stop-daemon') {
+    cmd_stop_daemon();
+} elsif ($action eq '--restart-daemon') {
+    cmd_restart_daemon();
+} elsif ($action eq '-h' || $action eq '--help' || $action eq '') {
+    show_help();
+} else {
+    print "Unknown command: $action\n";
+    show_help();
+    exit(1);
+}
+
+###############################################################################
+# Commands
+###############################################################################
+
+sub cmd_enable {
+    # ENABLED is the master switch. With it off the firewall is left alone, so
+    # a host can be taken out of service without uninstalling or disabling the
+    # systemd units.
+    if (($config->get('ENABLED') // '1') eq "0") {
+        print "ENABLED is set to 0 in hostguard.conf; not starting the firewall.\n";
+        print "Set ENABLED=1 to allow it to start.\n";
+        return;
+    }
+
+    print "Enabling HostGuard Pro firewall...\n";
+    HGFirewall->init($config);
+    eval { HGFirewall->start($config); };
+    if ($@) {
+        print "\nERROR: $@";
+        report_build_failures();
+        exit(1);
+    }
+    print "Firewall enabled.\n";
+    sync_testing_cron();
+}
+
+sub cmd_disable {
+    print "Disabling HostGuard Pro firewall...\n";
+    HGFirewall->init($config);
+    eval { HGFirewall->stop(); };
+    if ($@) {
+        print "ERROR: $@\n";
+        exit(1);
+    }
+    unless (remove_testing_cron()) {
+        print "Warning: could not remove $TESTING_CRON: $!\n";
+    }
+    print "Firewall disabled. All rules flushed.\n";
+}
+
+sub cmd_reload {
+    # Re-read config
+    $config = HGConfig->loadconfig();
+
+    if (($config->get('ENABLED') // '1') eq "0") {
+        print "ENABLED is set to 0 in hostguard.conf; stopping the firewall.\n";
+        cmd_disable();
+        return;
+    }
+
+    print "Reloading HostGuard Pro firewall rules...\n";
+    HGFirewall->init($config);
+    eval { HGFirewall->reload($config); };
+    if ($@) {
+        print "\nERROR: $@";
+        report_build_failures();
+        exit(1);
+    }
+    print "Firewall rules reloaded.\n";
+    sync_testing_cron();
+
+    # Signal daemon to reload if running
+    my $pid = get_daemon_pid();
+    if ($pid) {
+        kill('HUP', $pid);
+        print "Daemon signaled to reload configuration.\n";
+    }
+}
+
+sub cmd_allow {
+    my ($ip, $comment) = @_;
+    unless ($ip) {
+        print "Usage: hostguard -a <ip> [comment]\n";
+        exit(1);
+    }
+    unless (HGConfig->valid_ip($ip)) {
+        print "Error: Invalid IP address: $ip\n";
+        exit(1);
+    }
+
+    $comment ||= "CLI allow";
+    HGFirewall->init($config);
+
+    # allow() writes allow.conf either way and reports whether it also reached
+    # the running firewall. Saying "added" when it did not would be the worst
+    # possible moment to be wrong: this is the command an administrator runs on
+    # their own address before turning testing mode off.
+    if (HGFirewall->allow($ip, $comment)) {
+        print "IP $ip added to the allowlist and applied to the running firewall.\n";
+    } else {
+        print "IP $ip was written to allow.conf, but could NOT be applied to the\n";
+        print "running firewall. It is not allowed yet.\n\n";
+        print "Run 'hostguard -r' to apply it, then confirm with:\n";
+        print "  hostguard -g $ip\n";
+        exit(1);
+    }
+}
+
+sub cmd_deny {
+    my ($ip, $comment) = @_;
+    unless ($ip) {
+        print "Usage: hostguard -d <ip> [comment]\n";
+        exit(1);
+    }
+    unless (HGConfig->valid_ip($ip)) {
+        print "Error: Invalid IP address: $ip\n";
+        exit(1);
+    }
+
+    $comment ||= "CLI deny";
+    HGFirewall->init($config);
+
+    if (HGFirewall->permblock($ip, $comment)) {
+        print "IP $ip added to the denylist and applied to the running firewall.\n";
+    } else {
+        print "IP $ip was written to deny.conf, but could NOT be applied to the\n";
+        print "running firewall. It is not blocked yet.\n\n";
+        print "Run 'hostguard -r' to apply it.\n";
+        exit(1);
+    }
+}
+
+sub cmd_tempremove {
+    my ($ip) = @_;
+    unless ($ip) {
+        print "Usage: hostguard -tr <ip>\n";
+        exit(1);
+    }
+    unless (HGConfig->valid_ip($ip)) {
+        print "Error: Invalid IP address: $ip\n";
+        exit(1);
+    }
+
+    HGFirewall->init($config);
+    unless (HGFirewall->tempunblock($ip)) {
+        print "The block on $ip was removed from the running firewall, but its\n";
+        print "record could NOT be removed, so $ip will still be listed as\n";
+        print "temporarily blocked.\n\n";
+        print "See " . ($config->get('LOG_FILE') // '/var/log/hostguard/daemon.log')
+            . " for why.\n";
+        exit(1);
+    }
+    print "Temporary block removed for $ip.\n";
+}
+
+sub cmd_grep {
+    my ($ip) = @_;
+    unless ($ip) {
+        print "Usage: hostguard -g <ip>\n";
+        exit(1);
+    }
+    unless (HGConfig->valid_ip($ip)) {
+        print "Error: Invalid IP address: $ip\n";
+        exit(1);
+    }
+
+    HGFirewall->init($config);
+    my @results = HGFirewall->grep_ip($ip);
+    if (@results) {
+        print "Results for $ip:\n";
+        for my $r (@results) {
+            print "  $r\n";
+        }
+    } else {
+        print "No entries found for $ip.\n";
+    }
+}
+
+sub cmd_list {
+    HGFirewall->init($config);
+    my @blocks = HGFirewall->list_tempblocks();
+    my @active = grep { $_->{active} } @blocks;
+
+    if (@active) {
+        printf("%-18s %-12s %-8s %s\n", "IP Address", "Expires", "TTL", "Reason");
+        printf("%-18s %-12s %-8s %s\n", "-" x 16, "-" x 10, "-" x 6, "-" x 30);
+        for my $b (sort { $a->{expires} <=> $b->{expires} } @active) {
+            my $exp_str = strftime_safe($b->{expires});
+            my $ttl_str = format_duration($b->{ttl});
+            printf("%-18s %-12s %-8s %s\n", $b->{ip}, $exp_str, $ttl_str, $b->{reason});
+        }
+        print "\nTotal active temporary blocks: " . scalar(@active) . "\n";
+    } else {
+        print "No active temporary blocks.\n";
+    }
+}
+
+# Update the external block lists and apply them to the running firewall.
+#
+# Without an argument only lists whose cached copy has aged past their refresh
+# interval are fetched; "force" re-downloads every list.
+sub cmd_blocklists {
+    my ($mode) = @_;
+    my $force = (defined $mode && lc($mode) eq 'force') ? 1 : 0;
+
+    my @lists = HGBlocklist->load();
+    unless (@lists) {
+        print "No block lists are configured in $HGConfig::CONFIG_DIR/blocklists.conf.\n";
+        return;
+    }
+
+    HGFirewall->init($config);
+
+    my $updated = 0;
+    for my $entry (@lists) {
+        my $age = HGBlocklist->age($entry);
+        unless ($force || HGBlocklist->is_due($entry)) {
+            printf("%-24s up to date (%s old)\n", $entry->{name}, format_duration($age));
+            next;
+        }
+
+        printf("%-24s downloading...\n", $entry->{name});
+        my $count = HGBlocklist->refresh($entry, $config, force => $force);
+        if ($count) {
+            # The download succeeded. Applying it to the running firewall is a
+            # separate step that can fail on its own, and reporting the
+            # download's count for both would call a list updated while the
+            # firewall still matched the old one.
+            my $applied = HGFirewall->refresh_blocklist_set($entry->{name});
+            if ($applied) {
+                printf("%-24s %d entries\n", $entry->{name}, $count);
+                $updated++;
+            } else {
+                printf("%-24s %d entries downloaded, but NOT applied to the "
+                     . "running firewall\n", $entry->{name}, $count);
+                printf("%-24s the firewall still has the previous data; see %s\n",
+                       '', $config->get('LOG_FILE') // '/var/log/hostguard/daemon.log');
+            }
+        } else {
+            printf("%-24s update failed, see %s\n",
+                   $entry->{name},
+                   $config->get('LOG_FILE') // '/var/log/hostguard/daemon.log');
+        }
+    }
+
+    print "\n$updated list(s) updated.\n";
+}
+
+# Update the country zone files and apply them to the running firewall.
+sub cmd_countries {
+    my ($mode) = @_;
+    my $force = (defined $mode && lc($mode) eq 'force') ? 1 : 0;
+
+    my %flat = $config->config();
+    my ($geo_mode, @codes) = HGGeo->mode(\%flat);
+
+    unless ($geo_mode) {
+        print "Country filtering is off. Set GEO_ENABLE=1 and list codes in\n";
+        print "GEO_DENY or GEO_ALLOW in hostguard.conf.\n";
+        return;
+    }
+    unless (@codes) {
+        print "Country filtering is on but no country codes are configured.\n";
+        return;
+    }
+
+    print "Country filtering is in " . uc($geo_mode) . " mode for: "
+        . join(', ', @codes) . "\n\n";
+
+    HGFirewall->init($config);
+    my $updated = 0;
+
+    for my $cc (@codes) {
+        for my $family ('inet', 'inet6') {
+            next if $family eq 'inet6' && ($config->get('IPV6') // '0') ne '1';
+
+            my $label = "$cc " . ($family eq 'inet6' ? '(IPv6)' : '(IPv4)');
+            unless ($force || HGGeo->is_due($cc, \%flat, $family)) {
+                my $age = HGGeo->age($cc, $family);
+                printf("%-14s up to date (%s old)\n", $label, format_duration($age));
+                next;
+            }
+
+            printf("%-14s downloading...\n", $label);
+            my $count = HGGeo->refresh($cc, \%flat, force => $force, family => $family);
+            if ($count) {
+                my $applied = HGFirewall->refresh_geo_set($cc, $family);
+                if ($applied) {
+                    printf("%-14s %d ranges\n", $label, $count);
+                    $updated++;
+                } else {
+                    printf("%-14s %d ranges downloaded, but NOT applied to the "
+                         . "running firewall\n", $label, $count);
+                    printf("%-14s the firewall still has the previous ranges; "
+                         . "see %s\n", '',
+                           $config->get('LOG_FILE') // '/var/log/hostguard/daemon.log');
+                }
+            } elsif ($family eq 'inet6') {
+                # Not every country publishes an IPv6 zone file.
+                printf("%-14s no IPv6 file published\n", $label);
+            } else {
+                printf("%-14s update failed, see %s\n", $label,
+                       $config->get('LOG_FILE') // '/var/log/hostguard/daemon.log');
+            }
+        }
+    }
+
+    print "\n$updated zone file(s) updated.\n";
+    print "\nRun 'hostguard -r' to rebuild the rules if this is the first update.\n"
+        if $updated;
+}
+
+# Allow an address for a bounded period.
+sub cmd_tempallow {
+    my ($ip, $rest) = @_;
+
+    unless ($ip) {
+        print "Usage: hostguard -ta <ip> [seconds] [comment]\n";
+        print "       The default duration is 3600 seconds.\n";
+        exit(1);
+    }
+    unless (HGConfig->valid_ip($ip)) {
+        print "Error: Invalid IP address: $ip\n";
+        exit(1);
+    }
+
+    # A leading number is the duration; anything after it is the comment.
+    my $duration = 3600;
+    my $comment  = defined $rest ? $rest : '';
+    if ($comment =~ s/^\s*(\d+)\s*//) {
+        $duration = $1;
+    }
+    $comment = "CLI temporary allow" unless length $comment;
+
+    unless ($duration > 0 && $duration <= 31536000) {
+        print "Error: Duration must be between 1 and 31536000 seconds.\n";
+        exit(1);
+    }
+
+    HGFirewall->init($config);
+    unless (HGFirewall->tempallow($ip, $duration, $comment)) {
+        print "Error: Could not add the temporary allow. Check the log.\n";
+        exit(1);
+    }
+
+    print "IP $ip allowed for " . format_duration($duration) . ".\n";
+    print "It expires on its own; allow.conf has not been changed.\n";
+}
+
+sub cmd_tempallow_remove {
+    my ($ip) = @_;
+    unless ($ip) {
+        print "Usage: hostguard -tar <ip>\n";
+        exit(1);
+    }
+    unless (HGConfig->valid_ip($ip)) {
+        print "Error: Invalid IP address: $ip\n";
+        exit(1);
+    }
+
+    HGFirewall->init($config);
+    unless (HGFirewall->tempallow_remove($ip)) {
+        print "Error: the temporary allow for $ip was not fully removed. "
+            . "See " . ($config->get('LOG_FILE') // '/var/log/hostguard/daemon.log')
+            . " for the reason.\n";
+        exit(1);
+    }
+    print "Temporary allow removed for $ip.\n";
+}
+
+sub cmd_list_allows {
+    HGFirewall->init($config);
+    my @allows = HGFirewall->list_tempallows();
+
+    unless (@allows) {
+        print "No active temporary allows.\n";
+        return;
+    }
+
+    printf("%-40s %-12s %-8s %s\n", "IP Address", "Expires", "TTL", "Comment");
+    printf("%-40s %-12s %-8s %s\n", "-" x 38, "-" x 10, "-" x 6, "-" x 30);
+    for my $a (sort { $a->{expires} <=> $b->{expires} } @allows) {
+        printf("%-40s %-12s %-8s %s\n",
+               $a->{ip}, strftime_safe($a->{expires}),
+               format_duration($a->{ttl}), $a->{note});
+    }
+    print "\nTotal active temporary allows: " . scalar(@allows) . "\n";
+}
+
+# Run the security check and print its findings.
+sub cmd_security {
+    my %flat = $config->config();
+    my @findings = HGSystem->security_check(\%flat);
+
+    print "HostGuard Pro security check\n";
+    print "=" x 60 . "\n\n";
+
+    unless (@findings) {
+        print "No findings. Every setting reviewed looks reasonable.\n";
+        return;
+    }
+
+    my %order = (high => 0, medium => 1, low => 2);
+    for my $f (sort { $order{$a->{level}} <=> $order{$b->{level}} } @findings) {
+        printf("[%-6s] %s\n", uc($f->{level}), $f->{title});
+        print "          $f->{detail}\n";
+        print "          Setting: $f->{where}\n" if length $f->{where};
+        print "\n";
+    }
+
+    my $high   = grep { $_->{level} eq 'high' }   @findings;
+    my $medium = grep { $_->{level} eq 'medium' } @findings;
+    my $low    = grep { $_->{level} eq 'low' }    @findings;
+    print "$high high, $medium medium, $low low.\n";
+    print "\nThese are observations, not changes. Nothing has been modified.\n";
+}
+
+# Apply one of the built-in security presets.
+#
+# A preset only ever touches the settings it names, so anything tuned by hand
+# and not part of the preset survives. Ports are never touched: guessing which
+# ports a host needs is how a preset locks someone out of their own server.
+sub cmd_preset {
+    my ($name) = @_;
+
+    my %presets = (
+        low => {
+            LF_SSHD => 10, LF_FTPD => 15, LF_POP3D => 20, LF_IMAPD => 20,
+            LF_SMTPAUTH => 10, LF_CPANEL => 15,
+            LF_TEMP_BLOCK_DURATION => 900, LF_PERM_BLOCK_AFTER => 10,
+            LF_GLOBAL_THRESHOLD => 1, LF_GLOBAL_LIMIT => 30,
+            SCAN_ENABLE => 0, BOGON_ENABLE => 0,
+            PROC_SCAN => 0, FILE_SCAN => 0, INTEGRITY_ENABLE => 0,
+            SYNFLOOD => 0,
+        },
+        medium => {
+            LF_SSHD => 5, LF_FTPD => 10, LF_POP3D => 10, LF_IMAPD => 10,
+            LF_SMTPAUTH => 5, LF_CPANEL => 10,
+            LF_TEMP_BLOCK_DURATION => 3600, LF_PERM_BLOCK_AFTER => 3,
+            LF_GLOBAL_THRESHOLD => 1, LF_GLOBAL_LIMIT => 15,
+            SCAN_ENABLE => 1, BOGON_ENABLE => 1,
+            PROC_SCAN => 1, FILE_SCAN => 0, INTEGRITY_ENABLE => 0,
+            SYNFLOOD => 0,
+        },
+        high => {
+            LF_SSHD => 3, LF_FTPD => 5, LF_POP3D => 5, LF_IMAPD => 5,
+            LF_SMTPAUTH => 3, LF_CPANEL => 5,
+            LF_TEMP_BLOCK_DURATION => 21600, LF_PERM_BLOCK_AFTER => 2,
+            LF_GLOBAL_THRESHOLD => 1, LF_GLOBAL_LIMIT => 8,
+            SCAN_ENABLE => 1, BOGON_ENABLE => 1,
+            PROC_SCAN => 1, FILE_SCAN => 1, INTEGRITY_ENABLE => 1,
+            SYNFLOOD => 1, LF_DISTRIBUTED => 1,
+        },
+    );
+
+    $name = defined $name ? lc($name) : '';
+    unless (exists $presets{$name}) {
+        print "Usage: hostguard --preset <low|medium|high>\n\n";
+        print "  low     Relaxed thresholds. Suits a host with many legitimate\n";
+        print "          users who mistype passwords, or one still being set up.\n";
+        print "  medium  The shipped defaults, with scan and bogon filtering and\n";
+        print "          process reporting on. A reasonable starting point.\n";
+        print "  high    Tight thresholds, long blocks, and every reporting check\n";
+        print "          on. Expect more false positives and more mail.\n\n";
+        print "No preset changes any port setting, and none of them touches\n";
+        print "TCP_IN, TCP_OUT, UDP_IN or UDP_OUT.\n";
+        exit(1);
+    }
+
+    print "Applying the '$name' preset...\n\n";
+    my $preset = $presets{$name};
+    for my $key (sort keys %$preset) {
+        my $old = $config->get($key);
+        my $new = $preset->{$key};
+        $old = '(unset)' unless defined $old;
+        printf("  %-24s %-10s -> %s\n", $key, $old, $new);
+        $config->set($key, $new);
+    }
+
+    print "\nPreset applied to /etc/hostguard/hostguard.conf.\n";
+    print "Run 'hostguard -r' to rebuild the rules with these settings.\n";
+}
+
+# Run the process and file checks immediately, printing rather than mailing.
+sub cmd_scan {
+    my %flat = $config->config();
+
+    print "Running the process and file checks...\n";
+    print "(findings are written to the log; notices are not sent)\n\n";
+
+    # Every check is forced on for this run, so the command reports what it
+    # would find rather than only what is switched on. Nothing is sent by
+    # mail, so a manual run cannot flood a mailbox.
+    my %forced = (%flat,
+        PROC_SCAN        => '1',
+        FILE_SCAN        => '1',
+        PROC_USAGE_CHECK => '1',
+        PROC_USAGE_KILL  => '0',
+    );
+
+    my $procs = HGProcess->scan_processes(\%forced, quiet => 1);
+    print "Suspicious processes:      $procs\n";
+
+    my $counts = HGProcess->check_user_procs(\%forced, quiet => 1);
+    print "Accounts over the limit:   $counts\n";
+
+    my $usage = HGProcess->check_usage(\%forced, quiet => 1);
+    print "Processes over a limit:    $usage\n";
+
+    my $files = HGProcess->scan_temp_files(\%forced, quiet => 1);
+    print "Suspicious files:          $files\n";
+
+    my $total = $procs + $counts + $usage + $files;
+    if ($total) {
+        print "\n$total finding(s). Details are in "
+            . ($config->get('LOG_FILE') // '/var/log/hostguard/daemon.log') . "\n";
+        print "Nothing was terminated or removed.\n";
+    } else {
+        print "\nNothing found.\n";
+    }
+}
+
+sub cmd_integrity_reset {
+    HGWatch->reset_integrity();
+    print "Integrity baseline cleared.\n";
+    print "The next check records a fresh baseline and reports nothing.\n";
+    print "Do this after a deliberate package update, not to silence a report\n";
+    print "you have not explained.\n";
+}
+
+# Send one action to every cluster member.
+sub cmd_cluster {
+    my ($sub, $rest) = @_;
+
+    my %flat = $config->config();
+    $sub = defined $sub ? lc($sub) : '';
+
+    if ($sub eq 'list' || $sub eq '') {
+        my @members = HGCluster->members();
+        unless (@members) {
+            print "No cluster members are configured in "
+                . "$HGConfig::CONFIG_DIR/cluster.conf.\n";
+            return;
+        }
+        my ($kstat, $kmsg) = HGCluster->key_status(\%flat);
+        print "Cluster is " . ((($flat{CLUSTER_ENABLE} // '0') eq '1')
+                               ? "enabled" : "disabled") . "\n";
+        print "Key:      " . ($kstat eq 'ok' ? "configured" : uc($kstat)) . "\n";
+        # An unusable key stops the cluster entirely, so say exactly what is
+        # wrong and what to run, rather than leaving it at "MISSING".
+        print "          $kmsg\n" unless $kstat eq 'ok';
+        print "Port:     " . ($flat{CLUSTER_PORT} // 7654) . "\n";
+        print "Bind:     " . ($flat{CLUSTER_BIND} || '127.0.0.1') . "\n";
+        print "Members:  " . scalar(@members) . "\n";
+        print "  $_\n" for @members;
+
+        # A member list that does not name this host is normal, because
+        # --cluster applies locally before it sends. Said explicitly so that an
+        # operator reading the list does not conclude the local host is being
+        # left out of what they just asked for.
+        my @checked = map { _is_local_address($_) } @members;
+        print "\nNote: none of the members above is an address on this host.\n"
+            . "      That is fine - '--cluster deny' applies the block here\n"
+            . "      first and then sends it on.\n"
+            if (grep { defined } @checked) && !(grep { $_ } @checked);
+        return;
+    }
+
+    my %verbs = (
+        deny     => 'DENY',
+        tempdeny => 'TEMPDENY',
+        allow    => 'ALLOW',
+        unblock  => 'UNBLOCK',
+        ping     => 'PING',
+    );
+
+    unless (exists $verbs{$sub}) {
+        print "Usage: hostguard --cluster list\n";
+        print "       hostguard --cluster <deny|tempdeny|allow|unblock> <ip> [reason]\n";
+        print "       hostguard --cluster ping\n";
+        exit(1);
+    }
+
+    my $action = $verbs{$sub};
+    my $ip     = '0.0.0.0';
+    my $reason = 'manual';
+
+    if ($action ne 'PING') {
+        my @parts = split(/\s+/, (defined $rest ? $rest : ''));
+        $ip = shift @parts;
+        $reason = join(' ', @parts) || 'manual';
+        unless (defined $ip && HGConfig->valid_ip($ip)) {
+            print "Error: A valid IP address is required for $sub.\n";
+            exit(1);
+        }
+    }
+
+    # Applied here first, then sent.
+    #
+    # This only ever broadcast. The local host was included solely if its own
+    # address happened to be listed in cluster.conf and reachable on
+    # CLUSTER_BIND - and CLUSTER_BIND defaults to loopback, which an operator
+    # listing their peers by public address will not have listed. So
+    # "hostguard --cluster deny 198.51.100.9" on the host under attack blocked
+    # it on every other member and not on that one, while the guide described
+    # the command as blocking an address across the cluster.
+    #
+    # Doing it in this order also gives the invariant its meaning: the local
+    # result is known before anything is claimed about the cluster.
+    my $local = 1;
+    if ($action ne 'PING') {
+        HGFirewall->init($config);
+        if    ($action eq 'DENY')     { $local = HGFirewall->permblock($ip, "Cluster: $reason") }
+        elsif ($action eq 'TEMPDENY') { $local = HGFirewall->tempblock($ip,
+                                            $config->get('LF_TEMP_BLOCK_DURATION') // 3600,
+                                            "Cluster: $reason") }
+        elsif ($action eq 'ALLOW')    { $local = HGFirewall->allow($ip, "Cluster: $reason") }
+        elsif ($action eq 'UNBLOCK')  { $local = HGFirewall->tempunblock($ip) }
+
+        if ($local) {
+            print "Applied $action for $ip on this host.\n";
+        } else {
+            print "NOT applied on this host: see "
+                . ($config->get('LOG_FILE') // '/var/log/hostguard/daemon.log')
+                . " for why.\n";
+            print "Continuing to the other members, so the cluster is not held "
+                . "back by one host.\n";
+        }
+    }
+
+    my $sent = HGCluster->broadcast($action, $ip, $reason, \%flat);
+    my @members = HGCluster->members();
+    if ($sent) {
+        print "Sent $action to $sent of " . scalar(@members) . " member(s).\n";
+    } elsif (@members) {
+        print "Applied locally, but nothing was sent to the other members.\n"
+            if $action ne 'PING' && $local;
+        print "Check that CLUSTER_ENABLE=1, a key is set in cluster.key, and\n";
+        print "that the members in cluster.conf are reachable on the cluster port.\n";
+    } else {
+        print "No other members are configured in "
+            . "$HGConfig::CONFIG_DIR/cluster.conf.\n";
+    }
+
+    exit(1) unless $local;
+}
+
+# Whether an address belongs to this host, read from the kernel rather than by
+# running "ip", so it costs nothing.
+sub _is_local_address {
+    my ($addr) = @_;
+    return 0 unless defined $addr && length $addr;
+
+    # Without ip(8) the question cannot be answered, and answering "no" would
+    # print a note claiming this host is not in its own member list when
+    # nothing has been checked. Undef means unknown, and the caller treats
+    # unknown as "do not say anything".
+    return undef unless HGConfig::find_bin('ip');
+
+    if ($addr !~ /:/) {
+        my ($rc, $out) = HGConfig::run_command(HGConfig::find_bin('ip'),
+                                               '-4', '-o', 'addr', 'show');
+        return 0 if $rc || !defined $out;
+        return $out =~ /\binet \Q$addr\E\// ? 1 : 0;
+    }
+
+    my ($rc, $out) = HGConfig::run_command(HGConfig::find_bin('ip'),
+                                           '-6', '-o', 'addr', 'show');
+    return 0 if $rc || !defined $out;
+    return $out =~ /\binet6 \Q$addr\E\// ? 1 : 0;
+}
+
+sub cmd_status {
+    HGFirewall->init($config);
+    my $st = HGFirewall->status();
+    my $daemon_pid = get_daemon_pid();
+
+    print "HostGuard Pro v$VERSION\n";
+    print "=" x 50 . "\n";
+
+    if ($st->{running}) {
+        my $since = $st->{since} ? scalar(localtime($st->{since})) : "unknown";
+        print "Firewall:  ACTIVE (since $since)\n";
+    } else {
+        print "Firewall:  INACTIVE\n";
+    }
+
+    if ($daemon_pid && kill(0, $daemon_pid)) {
+        print "Daemon:    RUNNING (PID $daemon_pid)\n";
+    } else {
+        print "Daemon:    STOPPED\n";
+    }
+
+    # Which mechanism owns the daemon, so it is clear where a start or stop
+    # actually goes, and whether the unit's sandbox is in force at all.
+    if (systemd_owns_daemon()) {
+        my (undef, $active) = _systemctl('is-active', 'hostguardd.service');
+        $active = 'unknown' unless defined $active;
+        $active =~ s/\s+//g;
+        print "Managed:   systemd (unit is $active)\n";
+    } else {
+        print "Managed:   directly, without systemd\n";
+        print "           the unit sandbox does not apply to a daemon started this way\n";
+    }
+
+    print "Testing:   " . (($config->get('TESTING')  // '') eq "1" ? "ENABLED" : "disabled") . "\n";
+
+    # The auto-clear cron is state in its own right, not something to infer
+    # from TESTING: the two disagreeing is exactly the condition worth seeing.
+    if (-e '/etc/cron.d/hostguard_testing') {
+        print "Auto-clear: /etc/cron.d/hostguard_testing is INSTALLED"
+            . ((($config->get('TESTING') // '') eq '1')
+                ? "\n"
+                : " while TESTING=0.\n"
+                  . "           The firewall will be torn down on its schedule. "
+                  . "Run 'hostguard -r' to remove it.\n");
+    }
+
+    # A finding that was seen and never acknowledged. See HGWatch::_pending_file.
+    my @pending = eval { HGWatch->pending_notices() };
+    if (@pending) {
+        print "\nWARNING: " . scalar(@pending) . " monitoring finding(s) were "
+            . "recorded but never\n";
+        print "         confirmed reported:\n";
+        print "           $_->{kind}: $_->{summary}\n" for @pending;
+        print "         Search " . ($config->get('LOG_FILE')
+                                    // '/var/log/hostguard/daemon.log')
+            . " around that time for the detail.\n";
+    }
+
+    my $over = HGFirewall->denylist_overflow($config);
+    if ($over) {
+        print "\nWARNING: $over deny.conf entrie(s) are NOT loaded because "
+            . "DENY_IP_LIMIT is\n";
+        print "         " . ($config->get('DENY_IP_LIMIT') // 0)
+            . ". Those addresses are recorded as permanently blocked and are "
+            . "not\n";
+        print "         being blocked. Raise DENY_IP_LIMIT or prune "
+            . "deny.conf.\n";
+    }
+    print "IPv6:      " . (($config->get('IPV6')     // '') eq "1" ? "enabled" : "disabled") . "\n";
+    print "ipset:     " . (($config->get('LF_IPSET') // '') eq "1" ? "enabled" : "disabled") . "\n";
+
+    # Count entries
+    my @allow  = HGConfig->load_iplist("$HGConfig::CONFIG_DIR/allow.conf");
+    my @deny   = HGConfig->load_iplist("$HGConfig::CONFIG_DIR/deny.conf");
+    my @blocks = HGFirewall->list_tempblocks();
+    my @active = grep { $_->{active} } @blocks;
+
+    my @blocklists = HGBlocklist->load();
+    if (@blocklists) {
+        print "\nBlock lists:\n";
+        for my $entry (@blocklists) {
+            my ($v4, $v6) = HGBlocklist->cached_entries($entry->{name});
+            my $age = HGBlocklist->age($entry);
+            printf("  %-24s %d entries%s\n",
+                   $entry->{name},
+                   scalar(@$v4) + scalar(@$v6),
+                   defined $age ? " (updated " . format_duration($age) . " ago)"
+                                : " (never downloaded)");
+        }
+    }
+
+    # Country filtering
+    my %flat = $config->config();
+    my ($geo_mode, @codes) = HGGeo->mode(\%flat);
+    if ($geo_mode) {
+        print "\nCountry filtering (" . uc($geo_mode) . " mode):\n";
+        for my $cc (@codes) {
+            my $age = HGGeo->age($cc, 'inet');
+            printf("  %-6s %d ranges%s\n", $cc, HGGeo->count($cc),
+                   defined $age ? " (updated " . format_duration($age) . " ago)"
+                                : " (never downloaded)");
+        }
+    }
+
+    my @allows = HGFirewall->list_tempallows();
+
+    print "\nAllowlist: " . scalar(@allow) . " entries\n";
+    print "Denylist:  " . scalar(@deny) . " entries\n";
+    print "Temp blocks: " . scalar(@active) . " active\n";
+    print "Temp allows: " . scalar(@allows) . " active\n";
+
+    # Which of the optional checks are switched on. A subsystem that is off is
+    # shown too, so the answer to "why did nothing report this" is on screen.
+    my @subsystems = (
+        ['Login daemon',      'LF_DAEMON',        '1'],
+        ['Distributed attack','LF_DISTRIBUTED',   '0'],
+        ['Port scan tracking','SCAN_ENABLE',      '0'],
+        ['Bogon filtering',   'BOGON_ENABLE',     '0'],
+        ['Process scanning',  'PROC_SCAN',        '0'],
+        ['File scanning',     'FILE_SCAN',        '0'],
+        ['Path watching',     'WATCH_ENABLE',     '0'],
+        ['Integrity monitor', 'INTEGRITY_ENABLE', '0'],
+        ['Account tracking',  'NOTIFY_ACCOUNT_MOD','0'],
+        ['Mail tracking',     'RELAY_TRACK',      '0'],
+        ['Load alerting',     'LOAD_ALERT',       '0'],
+        ['Block notice',      'NOTICE_ENABLE',    '0'],
+        ['Cluster',           'CLUSTER_ENABLE',   '0'],
+    );
+
+    print "\nSubsystems:\n";
+    for my $sub (@subsystems) {
+        my ($label, $key, $default) = @$sub;
+        my $on = ($config->get($key) // $default) eq '1';
+        printf("  %-20s %s\n", $label, $on ? 'on' : 'off');
+    }
+
+    # Top outbound senders this hour, when mail tracking is on.
+    if (($config->get('RELAY_TRACK') // '0') eq '1') {
+        my @senders = HGRelay->top_senders(5);
+        if (@senders) {
+            print "\nTop outbound senders this hour:\n";
+            printf("  %-24s %s\n", $_->{account}, $_->{count}) for @senders;
+        }
+    }
+
+    print "\nPorts:\n";
+    print "  TCP_IN:  " . ($config->get('TCP_IN') // 'none') . "\n";
+    print "  TCP_OUT: " . ($config->get('TCP_OUT') // 'none') . "\n";
+    print "  UDP_IN:  " . ($config->get('UDP_IN') // 'none') . "\n";
+    print "  UDP_OUT: " . ($config->get('UDP_OUT') // 'none') . "\n";
+}
+
+# Whether systemd is running this host and owns the daemon unit.
+#
+# When it does, every start and stop has to go through it. Starting the daemon
+# directly puts it outside the unit's cgroup, which means outside its sandbox:
+# the ProtectSystem, ReadWritePaths and CapabilityBoundingSet settings in
+# hostguardd.service simply would not apply. systemd would also still believe
+# the unit is inactive, and starting it would then produce a second daemon.
+#
+# Stopping directly is no better. The unit carries Restart=on-failure, so a
+# daemon killed out from under systemd is started again moments later and the
+# stop appears not to have worked.
+sub systemd_owns_daemon {
+    return 0 unless -d '/run/systemd/system';          # systemd is pid 1
+    return 0 unless -f '/etc/systemd/system/hostguardd.service';
+    return 0 unless HGConfig::find_bin('systemctl');
+    return 1;
+}
+
+sub _systemctl {
+    my (@args) = @_;
+    my $bin = HGConfig::find_bin('systemctl') or return (1, 'systemctl not found');
+    return HGConfig::run_command($bin, @args);
+}
+
+sub cmd_start_daemon {
+    my $pid = get_daemon_pid();
+    if ($pid && kill(0, $pid)) {
+        print "Daemon already running (PID $pid).\n";
+        return;
+    }
+
+    if (systemd_owns_daemon()) {
+        print "Starting HostGuard Pro daemon via systemd...\n";
+        my ($rc, $out) = _systemctl('start', 'hostguardd.service');
+        if ($rc) {
+            print "systemctl start failed: $out\n";
+            print "Check: systemctl status hostguardd\n";
+            exit(1);
+        }
+    } else {
+        print "Starting HostGuard Pro daemon...\n";
+        system("/usr/local/hostguard/bin/hostguardd");
+    }
+
+    sleep(1);
+    $pid = get_daemon_pid();
+    if ($pid && kill(0, $pid)) {
+        print "Daemon started (PID $pid).\n";
+    } else {
+        print "Warning: Daemon may not have started. Check logs.\n";
+    }
+}
+
+sub cmd_restart_daemon {
+    # A single systemd transition rather than a stop followed by a start, so
+    # the unit does not briefly look failed and trip Restart=on-failure.
+    if (systemd_owns_daemon()) {
+        print "Restarting HostGuard Pro daemon via systemd...\n";
+        my ($rc, $out) = _systemctl('restart', 'hostguardd.service');
+        if ($rc) {
+            print "systemctl restart failed: $out\n";
+            exit(1);
+        }
+        sleep(1);
+        my $pid = get_daemon_pid();
+        print $pid ? "Daemon restarted (PID $pid).\n"
+                   : "Warning: Daemon may not have started. Check logs.\n";
+        return;
+    }
+
+    cmd_stop_daemon();
+    sleep(1);
+    cmd_start_daemon();
+}
+
+sub cmd_stop_daemon {
+    # systemd first, and whether or not a pid can be found: the unit may be
+    # active with a stale pid file, and asking systemd is what actually stops
+    # it. Signalling the process directly would only have it restarted.
+    if (systemd_owns_daemon()) {
+        print "Stopping HostGuard Pro daemon via systemd...\n";
+        my ($rc, $out) = _systemctl('stop', 'hostguardd.service');
+        if ($rc) {
+            print "systemctl stop failed: $out\n";
+            exit(1);
+        }
+        print "Daemon stopped.\n";
+        return;
+    }
+
+    my $pid = get_daemon_pid();
+    unless ($pid && kill(0, $pid)) {
+        print "Daemon is not running.\n";
+        return;
+    }
+    print "Stopping HostGuard Pro daemon (PID $pid)...\n";
+    kill('TERM', $pid);
+    # Wait up to 10 seconds
+    for (1..10) {
+        last unless kill(0, $pid);
+        sleep(1);
+    }
+    if (kill(0, $pid)) {
+        kill('KILL', $pid);
+        sleep(1);
+    }
+    unlink("/run/hostguardd.pid");
+    print "Daemon stopped.\n";
+}
+
+###############################################################################
+# Testing mode cron management
+###############################################################################
+
+# Make the safety cron match what TESTING says, whichever command got here.
+#
+# The cron is a function of the setting, not of the subcommand, and every path
+# that leaves a ruleset in force calls this. It is idempotent.
+#
+# That matters because of the documented route out of testing mode: start the
+# firewall, confirm you can still get in, set TESTING=0, run "hostguard -r".
+# If the cron were installed on enable and removed only on disable, a reload
+# would touch neither the file nor the question, and the entry would stay. Five
+# minutes later it would run "hostguard -x", tearing down both slots - and then
+# delete itself, since disabling does remove it.
+#
+# A host that had just been put into production would be left unfiltered,
+# permanently, with nothing recurring to notice and the unit still reporting
+# active: hostguard.service is Type=oneshot with RemainAfterExit=yes, so
+# systemctl goes on saying the firewall is up. The only trace would be the
+# daemon logging that its ipset adds were being refused.
+sub sync_testing_cron {
+    if (($config->get('TESTING') // 0) eq "1") {
+        my $interval = install_testing_cron();
+        if ($interval) {
+            print "\nWARNING: TESTING mode is enabled.\n";
+            print "  /etc/cron.d/hostguard_testing will clear the firewall every "
+                . "$interval minute(s),\n";
+            print "  so a ruleset that locks you out cannot lock you out for long.\n";
+            print "  Set TESTING=0 in hostguard.conf and run 'hostguard -r' when ready.\n";
+        }
+        return;
+    }
+
+    if (-e $TESTING_CRON) {
+        if (remove_testing_cron()) {
+            print "TESTING is 0; removed the auto-clear cron "
+                . "($TESTING_CRON).\n";
+        } else {
+            print "\nWARNING: TESTING is 0 but $TESTING_CRON could not be "
+                . "removed: $!\n";
+            print "  While it is there the firewall will be torn down on its "
+                . "schedule.\n";
+            print "  Delete it by hand before relying on this host.\n";
+        }
+    }
+}
+
+# Write the cron, returning the interval it was written with, or 0.
+sub install_testing_cron {
+    # Validated before it reaches a crontab line.
+    #
+    # The value was interpolated straight into "*/$interval * * * * root ...",
+    # and the configuration comment documents 1-60 without anything enforcing
+    # it. "5m", a stray space or an empty value produced a line cron rejects,
+    # so the safety net silently did not exist - at the one moment it is being
+    # relied on, by someone about to test a ruleset that might lock them out.
+    my $interval = $config->get('TESTING_INTERVAL');
+    unless (defined $interval && $interval =~ /^\d+$/
+            && $interval >= 1 && $interval <= 60) {
+        print "Warning: TESTING_INTERVAL is "
+            . (defined $interval && length $interval ? "\"$interval\"" : "not set")
+            . ", which is not a whole number of minutes between 1 and 60. "
+            . "Using 5.\n";
+        $interval = 5;
+    }
+
+    open(my $fh, '>', $TESTING_CRON) or do {
+        print "\nWARNING: cannot create $TESTING_CRON: $!\n";
+        print "  There is no auto-clear safety net. A ruleset that locks you "
+            . "out will stay in force.\n";
+        return 0;
+    };
+    print $fh "# HostGuard Pro TESTING mode - auto-disable firewall\n";
+    print $fh "# Removed automatically once TESTING=0 and the firewall is "
+            . "reloaded.\n";
+    my $ok = print $fh "*/$interval * * * * root /usr/local/hostguard/bin/hostguard "
+                     . "-x > /dev/null 2>&1\n";
+    $ok = 0 unless close($fh);
+
+    # Confirmed rather than assumed. A safety net that cannot report its own
+    # state is not one.
+    unless ($ok && -s $TESTING_CRON) {
+        print "\nWARNING: $TESTING_CRON was not written completely: $!\n";
+        print "  There is no auto-clear safety net.\n";
+        return 0;
+    }
+
+    chmod(0644, $TESTING_CRON);
+    return $interval;
+}
+
+sub remove_testing_cron {
+    return 1 unless -e $TESTING_CRON;
+    return unlink($TESTING_CRON) ? 1 : 0;
+}
+
+###############################################################################
+# Helpers
+###############################################################################
+
+# Print the rules that iptables rejected during the last build.
+#
+# Shown here as well as logged, because an administrator running this by hand
+# should not have to open the log to find out which rule was refused.
+sub report_build_failures {
+    my @failed = HGFirewall->failures();
+    return unless @failed;
+
+    print "The following rule(s) were rejected:\n\n";
+    print "  $_\n" for @failed;
+    print "\nThe firewall was not activated, so no half-built ruleset is in\n";
+    print "force. Fix the cause and run 'hostguard -e' again.\n\n";
+    print "A rejected match usually means the kernel module behind it is not\n";
+    print "loaded. Check one with:  iptables -m <match> --help\n";
+}
+
+sub get_daemon_pid {
+    my $pidfile = "/run/hostguardd.pid";
+    return 0 unless -f $pidfile;
+    open(my $fh, '<', $pidfile) or return 0;
+    my $pid = <$fh>;
+    close($fh);
+    chomp $pid if $pid;
+    return 0 unless $pid && $pid =~ /^\d+$/;
+
+    # A pid file outlives the process that wrote it. If the daemon was killed
+    # without removing it, the number in there eventually belongs to something
+    # else, and signalling it would stop an unrelated process. Confirm the pid
+    # is still the daemon before handing it to a caller that will signal it.
+    return 0 unless _pid_is_daemon($pid);
+    return $pid;
+}
+
+# True when the given pid is a running hostguardd.
+#
+# Checked against the command line rather than merely testing that the pid
+# exists, because "exists" is what a recycled pid also satisfies. On a system
+# without /proc there is nothing to check against, so the pid is accepted and
+# the original behaviour stands.
+sub _pid_is_daemon {
+    my ($pid) = @_;
+    return 1 unless -d '/proc';
+    return 0 unless -d "/proc/$pid";
+
+    open(my $fh, '<', "/proc/$pid/cmdline") or return 0;
+    my $cmd = do { local $/; <$fh> };
+    close($fh);
+    return 0 unless defined $cmd;
+    $cmd =~ tr/\0/ /;
+
+    return $cmd =~ /hostguardd/ ? 1 : 0;
+}
+
+sub strftime_safe {
+    my ($ts) = @_;
+    return "N/A" unless $ts;
+    return POSIX::strftime("%H:%M:%S", localtime($ts));
+}
+
+sub format_duration {
+    my ($secs) = @_;
+    return "0s" unless $secs;
+    if ($secs >= 86400) {
+        return sprintf("%dd%dh", int($secs/86400), int(($secs%86400)/3600));
+    } elsif ($secs >= 3600) {
+        return sprintf("%dh%dm", int($secs/3600), int(($secs%3600)/60));
+    } elsif ($secs >= 60) {
+        return sprintf("%dm%ds", int($secs/60), $secs%60);
+    }
+    return "${secs}s";
+}
+
+sub show_help {
+    print <<EOF;
+HostGuard Pro v$VERSION - Firewall & Login Protection
+
+Usage: hostguard [option] [arguments]
+
+Firewall:
+  -e, --enable            Enable and start the firewall
+  -x, --disable           Disable the firewall (flush all rules)
+  -r, --reload            Reload firewall rules from config
+  -s, --status            Show firewall and daemon status
+
+IP Management:
+  -a, --allow <ip> [note] Add IP to allowlist
+  -d, --deny  <ip> [note] Add IP to permanent denylist
+  -tr, --unblock <ip>     Remove a temporary block
+  -g, --grep <ip>         Search for IP in all lists and rules
+  -l, --list              List active temporary blocks
+
+  -ta, --temp-allow <ip> [secs] [note]
+                          Allow an IP for a bounded period (default 3600s)
+  -tar, --temp-allow-remove <ip>
+                          Remove a temporary allow
+  -la, --list-allows      List active temporary allows
+
+Block Lists:
+  -b, --blocklists        Update external block lists that are due
+  -b force                Re-download every list regardless of age
+  -c, --countries         Update country zone files that are due
+  -c force                Re-download every country zone file
+
+Checks:
+  --security              Run the server security check and print findings
+  --scan                  Run the process and file checks now
+  --integrity-reset       Clear the binary integrity baseline
+  --preset <low|medium|high>
+                          Apply a set of thresholds and switches
+
+Cluster:
+  --cluster list          Show cluster configuration and members
+  --cluster ping          Confirm members are reachable
+  --cluster deny <ip> [reason]
+                          Ask every member to block an address
+  --cluster tempdeny|allow|unblock <ip> [reason]
+
+Daemon:
+  --start-daemon          Start the login failure daemon
+  --stop-daemon           Stop the login failure daemon
+  --restart-daemon        Restart the login failure daemon
+
+Other:
+  -v, --version           Show version
+  -h, --help              Show this help
+
+Configuration: /etc/hostguard/hostguard.conf
+Patterns:      /etc/hostguard/patterns.conf
+Watched paths: /etc/hostguard/watch.conf
+Cluster:       /etc/hostguard/cluster.conf
+Logs:          /var/log/hostguard/daemon.log
+
+EOF
+}
+
+use POSIX qw(strftime);

@@ -1,0 +1,21 @@
+HostGuard Pro - Security Check
+==================================
+
+Server:   [HOSTNAME]
+Time:     [TIME]
+
+Findings above low severity: [COUNT]
+
+[FINDINGS]
+
+Every finding names the file that holds the setting.
+
+These are observations, not changes: nothing has been modified, and
+some of them will be correct for how this server is actually used. A
+finding is a question worth answering rather than a fault to clear.
+
+For the full list, including low severity:
+  hostguard --security
+
+--
+HostGuard Pro - https://fasthive.com/

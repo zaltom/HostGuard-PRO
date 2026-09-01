@@ -1,0 +1,22 @@
+HostGuard Pro - Cluster Event
+==================================
+
+Server:   [HOSTNAME]
+Time:     [TIME]
+
+Action:   [ACTION]
+Address:  [IP]
+Reason:   [REASON]
+
+A cluster member asked this server to apply the change above, and it
+has been applied locally.
+
+The request was authenticated against the shared key in
+/etc/hostguard/cluster.key and came from an address listed in
+cluster.conf. It has not been passed on to any other member.
+
+To review the cluster:
+  hostguard --cluster list
+
+--
+HostGuard Pro - https://fasthive.com/

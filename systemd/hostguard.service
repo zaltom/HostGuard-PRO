@@ -1,0 +1,64 @@
+[Unit]
+Description=HostGuard Pro Firewall
+After=network.target
+Before=hostguardd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/hostguard/bin/hostguard --enable
+ExecStop=/usr/local/hostguard/bin/hostguard --disable
+RemainAfterExit=yes
+
+###############################################################################
+# Sandboxing
+#
+# This unit builds and tears down the ruleset and then exits. It needs far less
+# than the daemon does, so it is held to a tighter set.
+#
+# It does not read authentication logs, walk /proc, open a listening socket or
+# send mail. It runs iptables, ipset and ipset's restore, and it writes its own
+# runtime state.
+###############################################################################
+
+NoNewPrivileges=yes
+
+# /etc/cron.d is writable for one reason: with TESTING=1 the CLI installs
+# /etc/cron.d/hostguard_testing, the cron entry that clears the firewall every
+# few minutes so a bad ruleset cannot lock anyone out permanently. Without this
+# path the safety net silently fails to install.
+ProtectSystem=strict
+ReadWritePaths=/etc/hostguard /var/lib/hostguard /var/log/hostguard /etc/cron.d
+
+ProtectHome=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+# AF_NETLINK for iptables and ipset. AF_INET and AF_INET6 are needed because
+# ipset resolves nothing but iptables may, and a PRE_SCRIPT or POST_SCRIPT hook
+# commonly does.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# Only what building a ruleset takes. Notably no CAP_KILL and no CAP_SYS_PTRACE:
+# this unit has no business signalling or inspecting another process.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH
+
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# A PRE_SCRIPT or POST_SCRIPT hook runs inside all of the above. A hook that
+# needs more than this - writing outside the paths above, signalling a process,
+# loading a module - needs the relevant line relaxed here, and that is worth
+# doing deliberately rather than by dropping the whole section.
+
+[Install]
+WantedBy=multi-user.target

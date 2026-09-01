@@ -1,0 +1,27 @@
+HostGuard Pro - Excessive Email
+==================================
+
+Server:   [HOSTNAME]
+Time:     [TIME]
+
+Account:  [ACCOUNT]
+Messages: [COUNT] in the current hour
+Limit:    [LIMIT]
+Script:   [SOURCE]
+
+No mail has been blocked and no account has been suspended.
+
+This is usually the first visible sign of a compromised site. The
+account is real and the credentials are real, so nothing in the firewall
+or the authentication logs looks wrong; the volume is the only symptom.
+
+If the account is not expected to send at this rate, look in the script
+directory above for what is sending on its behalf. A form without a
+captcha and a contact page that does not validate its recipient are the
+two usual causes.
+
+Current counts:
+  hostguard -s
+
+--
+HostGuard Pro - https://fasthive.com/

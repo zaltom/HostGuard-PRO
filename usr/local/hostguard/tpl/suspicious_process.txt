@@ -1,0 +1,30 @@
+HostGuard Pro - Suspicious Process
+==================================
+
+Server:   [HOSTNAME]
+Time:     [TIME]
+
+PID:      [PID]
+User:     [USER]
+Command:  [COMMAND]
+Binary:   [BINARY]
+CPU:      [CPU]%
+Memory:   [MEMORY] KB
+Running:  [RUNTIME]s
+
+Why it was reported:
+  [REASON]
+
+Nothing has been terminated. This check only ever reports, because none
+of the things it looks for is proof on its own: an administrator may
+well run a listener or an interpreter one-liner on purpose.
+
+What is worth checking, in order: whether the account should be running
+anything at all, whether the binary path makes sense, and what the
+process has open (lsof -p [PID]).
+
+If it is expected, add an exception to:
+  /etc/hostguard/procignore.conf
+
+--
+HostGuard Pro - https://fasthive.com/

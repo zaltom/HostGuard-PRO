@@ -1,0 +1,339 @@
+/*
+ * HostGuard Pro - WHM interface stylesheet
+ * /usr/local/cpanel/whostmgr/docroot/cgi/hostguard/hostguard.css
+ *
+ * Served from the plugin's own directory, same origin as the CGI. Nothing here
+ * is fetched from anywhere else: a WHM session runs as root, and a third-party
+ * asset in it would be someone else's code executing with that authority.
+ *
+ * The page links this with a ?v= carrying the installed version, so an upgrade
+ * busts the browser cache and a stale copy cannot outlive the markup it styles.
+ *
+ * Icons are not here. They are inline SVG in the CGI, because they inherit
+ * currentColor for the active navigation state and moving them to a sprite
+ * would add a request to save under 2KB.
+ */
+
+:root {
+  --bg:        #f8fafc;
+  --surface:   #ffffff;
+  --border:    #e2e8f0;
+  --border-sm: #f1f5f9;
+  --text:      #334155;
+  --muted:     #64748b;
+  --heading:   #0f172a;
+  --accent:    #10b981;
+  --accent-dk: #059669;
+  --danger:    #ef4444;
+  --warning:   #f59e0b;
+  --info:      #3b82f6;
+  --radius:    12px;
+  --radius-sm: 8px;
+  --shadow:    0 1px 2px rgba(15,23,42,.04), 0 4px 12px rgba(15,23,42,.04);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+               "Helvetica Neue", Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+.container { display: flex; min-height: 100vh; }
+
+/* ---------- Sidebar ---------- */
+.sidebar {
+  width: 260px; flex-shrink: 0;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  position: sticky; top: 0; height: 100vh; overflow-y: auto;
+}
+.brand {
+  display: flex; align-items: center; gap: 10px;
+  padding: 18px 20px; border-bottom: 1px solid var(--border);
+}
+.brand-mark {
+  width: 32px; height: 32px; border-radius: 9px; flex-shrink: 0;
+  background: var(--accent); color: #fff;
+  display: flex; align-items: center; justify-content: center;
+}
+.brand-name {
+  font-size: 15px; font-weight: 700; color: var(--heading);
+  letter-spacing: -.2px;
+}
+.brand-name span { color: var(--accent); }
+
+.nav { padding: 12px; flex: 1; }
+.nav-section {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .6px;
+  color: var(--muted); font-weight: 600;
+  padding: 16px 10px 6px;
+}
+.nav-section:first-child { padding-top: 4px; }
+.sidebar a {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 10px; margin-bottom: 1px;
+  color: var(--muted); text-decoration: none;
+  font-size: 14px; font-weight: 500;
+  border-radius: var(--radius-sm);
+  transition: background .12s, color .12s;
+}
+.sidebar a svg { width: 17px; height: 17px; flex-shrink: 0; opacity: .85; }
+.sidebar a:hover { background: var(--border-sm); color: var(--heading); }
+.sidebar a.active { background: var(--border-sm); color: var(--heading); }
+.sidebar a.active svg { color: var(--accent); opacity: 1; }
+
+.sidebar-foot {
+  padding: 14px 20px; border-top: 1px solid var(--border);
+  font-size: 11px; color: var(--muted);
+  display: flex; align-items: center; justify-content: space-between;
+}
+
+/* ---------- Main column ---------- */
+.main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+
+.topbar {
+  height: 64px; flex-shrink: 0;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 14px;
+  padding: 0 24px;
+  position: sticky; top: 0; z-index: 10;
+}
+.topbar-title { font-size: 15px; font-weight: 600; color: var(--heading); }
+.topbar-spacer { flex: 1; }
+.topbar-host { font-size: 13px; color: var(--muted); }
+
+.pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 10px; border-radius: 999px;
+  font-size: 12px; font-weight: 500;
+  background: var(--border-sm); color: var(--muted);
+}
+.pill .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.pill-on   { background: #ecfdf5; color: var(--accent-dk); }
+.pill-off  { background: #fef2f2; color: #b91c1c; }
+.pill-warn { background: #fffbeb; color: #b45309; }
+
+.content { padding: 24px; flex: 1; }
+
+.main h2 {
+  font-size: 22px; font-weight: 700; color: var(--heading);
+  letter-spacing: -.3px; margin-bottom: 4px;
+}
+.main h2 + p { color: var(--muted); margin-bottom: 18px; }
+
+/* ---------- Cards ---------- */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 20px;
+  margin-bottom: 16px;
+}
+.card h3 {
+  font-size: 15px; font-weight: 600; color: var(--heading);
+  margin-bottom: 14px; padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-sm);
+}
+.card > p { color: var(--muted); }
+.card > p + p { margin-top: 8px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+
+/* ---------- Stat tiles ---------- */
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+.stat {
+  background: var(--bg); border: 1px solid var(--border-sm);
+  border-radius: 10px; padding: 14px;
+}
+.stat-label {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .5px;
+  color: var(--muted); font-weight: 600; margin-bottom: 6px;
+}
+.stat-value { font-size: 22px; font-weight: 700; color: var(--heading); letter-spacing: -.4px; }
+.stat-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.stat-value.ok   { color: var(--accent-dk); }
+.stat-value.bad  { color: var(--danger); }
+
+/* ---------- Tables ---------- */
+.info-table { width: 100%; }
+.info-table td { padding: 7px 0; border-bottom: 1px solid var(--border-sm); }
+.info-table tr:last-child td { border-bottom: 0; }
+.info-table td:first-child { font-weight: 500; width: 42%; color: var(--muted); }
+.info-table td:last-child { text-align: right; }
+.status-on, .status-off, .status-warn { white-space: nowrap; }
+
+.data-table { width: 100%; border-collapse: collapse; }
+.data-table th {
+  text-align: left; padding: 8px 10px;
+  font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px;
+  color: var(--muted); border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.data-table td { padding: 10px; border-bottom: 1px solid var(--border-sm); }
+.data-table tr:last-child td { border-bottom: 0; }
+.data-table tbody tr:hover, .data-table tr:hover { background: var(--bg); }
+.table-wrap { overflow-x: auto; }
+
+/* ---------- Buttons ---------- */
+/*
+ * Measured from the reference dashboard rather than approximated.
+ *
+ * Two things there are easy to get wrong. The buttons are overwhelmingly
+ * neutral: a subtle fill with a hairline border, with colour reserved for the
+ * one action that commits a change. And the primary carries BLACK text, not
+ * white, because the accent is light enough that black reads better on it.
+ */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  /* Explicit height, as the reference does, so a coloured button and a
+     bordered one are the same size and a form row lines up with its input. */
+  height: 36px; padding: 0 16px;
+  border: .8px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--border-sm);
+  color: var(--text);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 14px; line-height: 20px; font-weight: 500;
+  text-decoration: none; white-space: nowrap;
+  transition: background-color .2s, border-color .2s, color .2s;
+}
+.btn:hover:not(:disabled) {
+  background: var(--surface);
+  color: var(--heading);
+  border-color: rgba(16, 185, 129, .3);
+}
+.btn:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+}
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+
+/* The action that commits a change. Solid accent, no border, black label. */
+.btn-primary,
+.btn-success {
+  background: var(--accent);
+  border-color: transparent;
+  color: #000;
+}
+.btn-primary:hover:not(:disabled),
+.btn-success:hover:not(:disabled) {
+  background: rgba(16, 185, 129, .9);
+  border-color: transparent;
+  color: #000;
+}
+
+/*
+ * The reference has no destructive button to copy, so these keep its geometry
+ * exactly and change only the fill. White on red and blue, black on amber, in
+ * each case whichever the fill is light enough to carry.
+ */
+/*
+ * One step darker than the palette's --danger and --info.
+ *
+ * Those two are the right hue for a status dot or a line of text, but white on
+ * them measures 3.8:1 and 3.7:1, under the 4.5:1 that 14px text needs. The
+ * shade below carries the same meaning and clears it. The accent and the amber
+ * need no such adjustment: black on them measures 8.3:1 and 9.8:1, which is
+ * why the reference sets its primary label black rather than white.
+ */
+.btn-danger {
+  background: #dc2626; border-color: transparent; color: #fff;
+}
+.btn-danger:hover:not(:disabled) {
+  background: rgba(220, 38, 38, .9); border-color: transparent; color: #fff;
+}
+.btn-warning {
+  background: var(--warning); border-color: transparent; color: #000;
+}
+.btn-warning:hover:not(:disabled) {
+  background: rgba(245, 158, 11, .9); border-color: transparent; color: #000;
+}
+.btn-info {
+  background: #2563eb; border-color: transparent; color: #fff;
+}
+.btn-info:hover:not(:disabled) {
+  background: rgba(37, 99, 235, .9); border-color: transparent; color: #fff;
+}
+
+/* The row-level variant, for an Unblock or Remove sitting inside a table. */
+.btn-sm {
+  height: 30px; padding: 0 12px; gap: 6px;
+  font-size: 12px; line-height: 16px;
+  color: var(--muted);
+}
+.btn-sm:hover:not(:disabled) { color: var(--heading); }
+.btn-sm.btn-primary, .btn-sm.btn-success { color: #000; }
+.btn-sm.btn-warning { color: #000; }
+.btn-sm.btn-danger, .btn-sm.btn-info { color: #fff; }
+
+/* ---------- Alerts ---------- */
+.alert {
+  padding: 12px 14px; border-radius: 10px; margin-bottom: 16px;
+  border: 1px solid transparent; font-size: 13px;
+}
+.alert-success { background: #ecfdf5; color: #065f46; border-color: #a7f3d0; }
+.alert-danger  { background: #fef2f2; color: #991b1b; border-color: #fecaca; }
+.alert-warning { background: #fffbeb; color: #92400e; border-color: #fde68a; }
+.alert-info    { background: #eff6ff; color: #1e40af; border-color: #bfdbfe; }
+
+/* ---------- Forms ---------- */
+.inline-form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.inline-form label { display: flex; align-items: center; gap: 5px; }
+/*
+ * Inputs share the buttons' geometry so a form row lines up: same height, same
+ * radius, same hairline border. Focus is a border colour change and nothing
+ * else, which is what the reference does; a glow ring would be louder than
+ * anything else on the page.
+ */
+.inline-form input[type="text"], .inline-form input[type="number"], .inline-form select {
+  height: 36px; padding: 0 12px;
+  border: .8px solid var(--border); border-radius: var(--radius-sm);
+  font-size: 14px; font-family: inherit; color: var(--text);
+  background: var(--bg);
+  transition: border-color .2s;
+}
+.inline-form input::placeholder { color: var(--muted); opacity: .7; }
+.inline-form input:focus, .inline-form select:focus, .code-editor:focus {
+  outline: none; border-color: var(--accent);
+}
+.code-editor {
+  width: 100%; font-family: ui-monospace, "Cascadia Code", "Fira Code", Consolas, monospace;
+  font-size: 13px; border: .8px solid var(--border); border-radius: var(--radius-sm);
+  padding: 12px; background: var(--bg); line-height: 1.6; tab-size: 4; color: var(--text);
+  transition: border-color .2s;
+}
+.log-box {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px; background: var(--heading); color: #cbd5e1;
+  padding: 16px; border-radius: 10px; overflow-x: auto;
+  white-space: pre-wrap; word-break: break-all; line-height: 1.6;
+  max-height: 420px; overflow-y: auto;
+}
+
+/* ---------- Status text ---------- */
+.status-on   { color: var(--accent-dk); font-weight: 600; }
+.status-off  { color: var(--danger); font-weight: 600; }
+.status-warn { color: var(--warning); font-weight: 600; }
+
+code {
+  font-family: ui-monospace, Consolas, monospace; font-size: .92em;
+  background: var(--border-sm); padding: 2px 5px; border-radius: 4px; color: var(--heading);
+}
+
+@media (max-width: 860px) {
+  .container { flex-direction: column; }
+  .sidebar { width: 100%; height: auto; position: static; }
+  .sidebar a { display: inline-flex; }
+  .nav { display: flex; flex-wrap: wrap; gap: 4px; }
+  .nav-section { width: 100%; }
+  .content { padding: 16px; }
+}

@@ -1,0 +1,29 @@
+HostGuard Pro - Suspicious File
+==================================
+
+Server:   [HOSTNAME]
+Time:     [TIME]
+
+Path:     [PATH]
+Owner:    [OWNER]
+Mode:     [MODE]
+Size:     [SIZE] bytes
+
+Why it was reported:
+  [REASON]
+
+The file has not been changed, moved or removed.
+
+It was found in a world-writable directory, which is where a dropped
+payload lands because it is the one place every account can write. That
+does not make it hostile: build systems, package managers and session
+handlers all use these directories legitimately.
+
+Inspect it before deleting it. What it is matters more than that it is
+there, and deleting it destroys the evidence of how it arrived.
+
+If it is expected, add its directory to:
+  /etc/hostguard/procignore.conf
+
+--
+HostGuard Pro - https://fasthive.com/

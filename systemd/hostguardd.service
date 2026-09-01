@@ -1,0 +1,157 @@
+[Unit]
+Description=HostGuard Pro Login Failure Daemon
+After=network.target hostguard.service
+Wants=hostguard.service
+
+[Service]
+Type=forking
+PIDFile=/run/hostguardd.pid
+ExecStart=/usr/local/hostguard/bin/hostguardd
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+# Exit status 1 is the daemon declining to run because TESTING=1 is set in
+# hostguard.conf. That is a configuration state rather than a fault, so it
+# is not retried.
+RestartPreventExitStatus=1
+LimitNOFILE=4096
+
+# A ceiling on memory, so a fault or a hostile input cannot take the host down
+# with it.
+#
+# The daemon holds several tables keyed on things the other side chooses, and
+# reads log lines whose length it does not control. All of those are bounded in
+# code, but a ceiling here is what makes the bound a property of the system
+# rather than of every one of those code paths staying correct.
+# Restart=on-failure above brings it back if it is ever reached, and the OOM
+# report names this service instead of the kernel picking whatever was largest.
+#
+# The figure is measured against the daemon's ordinary work, which is larger
+# than the attacker-influenced tables that motivate the ceiling. One block list
+# at the shipped BLOCKLIST_MAX_SIZE of 20 MB is about 1.75 million addresses,
+# which costs:
+#
+#   entry array + de-duplication hash      388 MB
+#   ipset restore script (now streamed)      0 MB   (was 268 MB)
+#                                          ------
+#   peak for one list                      388 MB
+#
+# A large country's zone file is roughly a third of that. 1G leaves room for a
+# refresh to coincide with the process's own baseline and with a second list
+# whose cached copy is being read, without leaving so much that a genuine
+# runaway goes unnoticed.
+#
+# If you raise BLOCKLIST_MAX_SIZE, or set a list's MAX to 0 on a very large
+# source, raise this with it: those two settings are what actually bound the
+# figure above.
+MemoryAccounting=yes
+MemoryMax=1G
+
+###############################################################################
+# Sandboxing
+#
+# This daemon runs as root and cannot stop doing so: it drives iptables and
+# ipset, reads every authentication log, reads /etc/shadow to notice a changed
+# password, and walks /proc across every account. What the settings below do is
+# reduce what a fault in it could reach, not remove the need for root.
+#
+# Each one is here because it was checked against a feature. Several of the
+# usual hardening directives are deliberately absent, and the comments say why,
+# because the failure mode is silent: the service still starts and one check
+# quietly stops finding anything.
+###############################################################################
+
+# Already root, so nothing is gained by acquiring privileges through a setuid
+# binary. Note that this also applies to any BLOCK_REPORT, PRE_SCRIPT or
+# POST_SCRIPT hook: a hook that relies on a setuid helper needs this removed.
+NoNewPrivileges=yes
+
+# The whole filesystem is read-only except the paths named below.
+#
+# Two files under /etc/hostguard are writable, not the directory. The daemon
+# appends to deny.conf when it promotes an address to a permanent block, and
+# to allow.conf when a cluster member sends an ALLOW. Those are the only
+# writes it makes under /etc, and naming them individually is worth the
+# awkwardness: with the directory writable, a bug in this daemon could rewrite
+# hostguard.conf - which carries PRE_SCRIPT, POST_SCRIPT and BLOCK_REPORT, all
+# of them commands this service runs as root on the next reload - or replace
+# cluster.key, patterns.conf or watch.conf. None of that is anything the
+# daemon needs to do, and all of it survives a restart.
+#
+# Both files are created by the installer and must exist for the service to
+# start: systemd cannot bind-mount a path that is not there, and the unit
+# fails with "No such file or directory" rather than starting unprotected. If
+# you remove one, recreate it empty:
+#
+#   touch /etc/hostguard/deny.conf && chmod 600 /etc/hostguard/deny.conf
+#
+# Note also that both are appended to in place, and that this is a constraint on
+# every writer of these two files, not only on the daemon.
+#
+# A bind mount of a file is bound to the inode, so a process outside this
+# namespace that replaces the path by rename would leave the daemon writing to
+# the inode that had been there. The daemon would append permanent blocks to an
+# unlinked file: print and close would both succeed, the ipset add would
+# succeed, permblock would correctly report success, and the next reload would
+# read a file that had never contained the address.
+#
+# The WHM list editor therefore writes these two files in place rather than by
+# rename. Anything else that learns to write them must do the same.
+#
+# /run is writable for the PID file.
+ProtectSystem=strict
+ReadWritePaths=/etc/hostguard/deny.conf /etc/hostguard/allow.conf
+ReadWritePaths=/var/lib/hostguard /var/log/hostguard /run
+
+# Home directories are read, never written: FILE_SCAN_DIRS may point at a
+# directory under /home on a shared host.
+ProtectHome=read-only
+
+# DO NOT set PrivateTmp=yes.
+#
+# It is the usual first directive and it would break this service silently.
+# FILE_SCAN exists to find payloads dropped in /tmp, /var/tmp and /dev/shm; a
+# private namespace means the scan sees an empty directory and reports nothing
+# for as long as it is enabled. The setting below is the default, written out
+# so it is not "tidied up" later.
+PrivateTmp=no
+
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectProc=default
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+# AF_NETLINK is what iptables and ipset talk over. AF_INET and AF_INET6 are the
+# cluster listener, the block notice responder and the block list downloads.
+# AF_UNIX is the local syslog socket and the pipe to sendmail.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# What is left after dropping CAP_SYS_MODULE, CAP_SYS_BOOT, CAP_SYS_ADMIN,
+# CAP_SYS_RAWIO and the rest:
+#
+#   NET_ADMIN, NET_RAW   iptables and ipset
+#   KILL                 PROC_USAGE_KILL sending SIGTERM to another account
+#   DAC_READ_SEARCH      reading /etc/shadow and root-only logs
+#   SYS_PTRACE           reading /proc/<pid>/exe for a process it does not own
+#   SETUID, SETGID       sendmail dropping to its own account when handed a
+#                        message
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_KILL CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_SETUID CAP_SETGID
+
+# The first line to comment out if something stops working after an upgrade to
+# curl, wget or the local mailer, since those run inside this filter too.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# MemoryDenyWriteExecute is not set. Perl itself is fine with it, but it has
+# broken XS modules in the past and the protection it adds to a script
+# interpreter is small.
+
+[Install]
+WantedBy=multi-user.target

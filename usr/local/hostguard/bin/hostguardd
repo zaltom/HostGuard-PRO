@@ -1,0 +1,1534 @@
+#!/usr/bin/perl
+###############################################################################
+# HostGuard Pro - Login Failure Daemon (hostguardd)
+# /usr/local/hostguard/bin/hostguardd
+#
+# Long-running daemon that watches the host and reacts to what it sees.
+#
+# Its original job, and still its main one, is to read authentication logs and
+# block brute-force sources. Around that it now runs a set of periodic checks,
+# each independently switchable and each off by default:
+#
+#   log reading        authentication failures, successful logins, su and root
+#                      access, outbound mail, and administrator-defined
+#                      patterns
+#   temporary blocks   expiry and cleanup
+#   block lists        refreshing external lists and country zone files
+#   processes          suspicious commands, per-user counts, resource usage
+#   files              world-writable directories, watched paths, binary
+#                      integrity, account changes
+#   host               sustained load average, security check, statistics
+#   cluster            accepting blocks propagated by other members
+#   notice service     answering blocked visitors
+#
+# Each check runs on its own interval through the scheduler below, so a slow
+# one cannot starve the log reading that everything else depends on.
+#
+# Logs are tracked by inode and size so that rotation, whether by rename or by
+# truncation in place, is detected and the file reopened without losing
+# entries.
+###############################################################################
+use strict;
+use warnings;
+use POSIX qw(strftime setsid);
+use Fcntl qw(:DEFAULT :flock);
+use File::Basename;
+# For sync(): the history file is renamed into place, and a rename is only as
+# durable as the writes that preceded it.
+use IO::Handle;
+
+# Add our lib path
+use lib '/usr/local/hostguard/lib';
+use HGConfig;
+use HGFirewall;
+use HGLogger;
+use HGBlocklist;
+use HGDetect;
+use HGAlert;
+use HGProcess;
+use HGWatch;
+use HGRelay;
+use HGSystem;
+use HGGeo;
+use HGCluster;
+use HGNotice;
+
+# Globals
+# Longest log line examined. Every pattern here matches within the first few
+# hundred characters of a line; anything past this is not a log entry.
+my $MAX_LOG_LINE = 8192;
+my $LAST_LONG_LINE_WARN = 0;
+
+my $PIDFILE    = "/run/hostguardd.pid";
+my $DATA_DIR   = $HGConfig::DATA_DIR;
+my $CONFIG_DIR = $HGConfig::CONFIG_DIR;
+my $RUNNING    = 1;
+my $RELOAD     = 0;
+my %config;
+my $CFG;
+
+# IP => { service => count, first_seen => time, total => count }
+my %counters;
+# IP => { count => times temp-blocked, last => when }
+my %block_history;
+# Successful logins per address per hour, for the login rate limit.
+my %login_rate;
+# Account => { hour, addresses } for distributed attack detection.
+my %account_attempts;
+
+my @CUSTOM_PATTERNS;
+
+# Set when %block_history has changed since it was last written out.
+my $BLOCK_HISTORY_DIRTY = 0;
+
+###############################################################################
+# Configuration sanity
+###############################################################################
+
+# Bring configuration values that have to be numbers into a usable state.
+#
+# Called after every load, so that nothing downstream has to wonder. It covers
+# LF_TEMP_BLOCK_DURATION because that one has a failure mode worth the code:
+# HGFirewall refuses a duration that is not a positive number of seconds, so a
+# typo - "1h", a stray minus, a value left empty - would stop the daemon
+# blocking anything at all. Blocking for the documented default is better than
+# not blocking, provided the substitution is said out loud.
+sub sanitise_config {
+    my $key   = 'LF_TEMP_BLOCK_DURATION';
+    my $value = $config{$key};
+    return if defined $value && $value =~ /^\d+$/ && $value > 0;
+
+    HGLogger->log_warn("$key is "
+                     . (defined $value && length $value ? "\"$value\"" : "not set")
+                     . ", which is not a number of seconds; using 3600. "
+                     . "Temporary blocks would otherwise be refused.");
+    $config{$key} = 3600;
+}
+
+###############################################################################
+# Signal handlers
+###############################################################################
+$SIG{TERM} = $SIG{INT} = sub { $RUNNING = 0; };
+$SIG{HUP}  = sub { $RELOAD = 1; };
+$SIG{USR1} = sub { dump_state(); };
+# A child that outlives its parent - the mailer, a block report hook - must
+# not be left as a zombie for the lifetime of the daemon.
+$SIG{CHLD} = 'IGNORE';
+
+###############################################################################
+# Bounded tracking tables
+###############################################################################
+
+# Every table the daemon keeps is keyed by something an attacker supplies: a
+# source address, or worse, a user name copied out of a log line. Nothing stops
+# one host from inventing a fresh user name on every attempt, so a table keyed
+# on them grows for as long as the attack lasts.
+#
+# The prune tasks only clear entries from a previous hour or window, which
+# bounds nothing inside the current one. A daemon that is killed for using too
+# much memory blocks nothing at all, so the tables are capped.
+#
+# Eviction is by least recently touched. That is deliberate rather than
+# arbitrary: an attack that matters keeps touching its entry and survives,
+# while the one-shot junk that would flood the table is what gets dropped.
+#
+# The tradeoff is real and worth stating: an attacker who floods a table can
+# push out entries that were part way to a threshold, and lose themselves that
+# way. Being forgotten is a better failure than the daemon being killed.
+# $keep names the entry currently being decided about, and is never evicted.
+#
+# Without it the eviction can drop the very entry its caller is in the middle
+# of using. That is not a remote possibility: eviction happens during a flood,
+# a flood creates thousands of entries within the same second, and every one of
+# them then carries the same "last" value. The comparator returns 0 for all of
+# them, so the order among them is arbitrary and the entry just touched is as
+# likely to go as any other.
+#
+# The consequence differs by caller and is wrong in every case: a failure
+# counter silently reset instead of reaching its threshold, an account marked as
+# blocked on a hashref no longer in the table so the same attack triggers again
+# and again, or a repeat offender's history lost so it never reaches
+# LF_PERM_BLOCK_AFTER.
+sub cap_table {
+    my ($table, $max, $label, $keep) = @_;
+
+    my $count = scalar(keys %$table);
+    return 0 if $count <= $max;
+
+    # Trimmed to three quarters rather than exactly to the cap, so a table
+    # sitting at the limit does not sort itself on every single insert.
+    my $target = int($max * 0.75);
+
+    my @candidates = grep { !defined $keep || $_ ne $keep } keys %$table;
+
+    # Oldest first, with the key as a tiebreak so that entries sharing a second
+    # are dropped in a defined order rather than an arbitrary one.
+    my @oldest = sort {
+        ($table->{$a}{last} // 0) <=> ($table->{$b}{last} // 0)
+            or $a cmp $b
+    } @candidates;
+
+    my $drop = $count - $target;
+    $drop = scalar(@oldest) if $drop > scalar(@oldest);
+    return 0 if $drop <= 0;
+
+    delete $table->{$_} for @oldest[0 .. $drop - 1];
+
+    HGLogger->log_warn("$label tracking table reached $count entries (limit "
+                     . "$max); dropped $drop least recently seen. This is "
+                     . "normally a sign of a flood of invented names or "
+                     . "addresses.");
+    return $drop;
+}
+
+sub _cap {
+    my ($key, $default) = @_;
+    my $v = $config{$key};
+    return ($v && $v =~ /^\d+$/ && $v > 0) ? $v : $default;
+}
+
+###############################################################################
+# Periodic task schedule
+###############################################################################
+
+# Each entry is a check, how often it runs, and the configuration key that
+# switches it on. A task whose key is off is skipped without being timed, so
+# an unused subsystem costs one hash lookup per cycle.
+#
+# The intervals are deliberately unequal. Nothing here needs to run at the
+# same moment as anything else, and staggering them keeps the daemon from
+# doing all of its work in one spike every few minutes.
+my @TASKS = (
+    # cleanup_expired also reconciles: the kernel adds to the temporary block
+    # set on its own when port scan detection fires, and nothing recorded those
+    # blocks, so they were invisible to the CLI and the WHM page and were
+    # dropped by every reload. See HGFirewall::reconcile_tempblocks.
+    {   name     => 'expire_blocks',
+        interval => 180,
+        key      => undef,
+        run      => sub { HGFirewall->cleanup_expired(); },
+    },
+    {   name     => 'blocklists',
+        interval => 300,
+        key      => 'BLOCKLIST_ENABLE',
+        run      => \&refresh_blocklists,
+    },
+    {   name     => 'country_zones',
+        interval => 3600,
+        key      => 'GEO_ENABLE',
+        run      => \&refresh_geo,
+    },
+    {   name     => 'processes',
+        interval => 'PROC_INTERVAL',
+        key      => 'PROC_SCAN',
+        run      => sub { HGProcess->scan_processes(\%config); },
+    },
+    {   name     => 'process_counts',
+        interval => 'PROC_INTERVAL',
+        key      => 'PROC_COUNT_ALERT',
+        run      => sub { HGProcess->check_user_procs(\%config); },
+    },
+    {   name     => 'process_usage',
+        interval => 'PROC_INTERVAL',
+        key      => 'PROC_USAGE_CHECK',
+        run      => sub { HGProcess->check_usage(\%config); },
+    },
+    {   name     => 'temp_files',
+        interval => 'FILE_INTERVAL',
+        key      => 'FILE_SCAN',
+        run      => sub { HGProcess->scan_temp_files(\%config); },
+    },
+    {   name     => 'watched_paths',
+        interval => 'WATCH_INTERVAL',
+        key      => 'WATCH_ENABLE',
+        run      => sub { HGWatch->watch_paths(\%config); },
+    },
+    {   name     => 'integrity',
+        interval => 'INTEGRITY_INTERVAL',
+        key      => 'INTEGRITY_ENABLE',
+        run      => sub { HGWatch->check_integrity(\%config); },
+    },
+    {   name     => 'accounts',
+        interval => 300,
+        key      => 'NOTIFY_ACCOUNT_MOD',
+        run      => sub { HGWatch->check_accounts(\%config); },
+    },
+    {   name     => 'load_average',
+        interval => 60,
+        key      => 'LOAD_ALERT',
+        run      => sub { HGSystem->check_load(\%config); },
+    },
+    {   name     => 'relay',
+        interval => 300,
+        key      => 'RELAY_TRACK',
+        run      => sub { HGRelay->check(\%config); },
+    },
+    {   name     => 'security_check',
+        interval => 86400,
+        key      => 'SECURITY_ALERT',
+        run      => sub { HGSystem->report_security(\%config); },
+    },
+    {   name     => 'statistics',
+        interval => 60,
+        key      => 'STATS_ENABLE',
+        run      => \&record_statistics,
+    },
+    {   name     => 'prune_state',
+        interval => 3600,
+        key      => undef,
+        run      => \&prune_state,
+    },
+    # One "iptables -S INPUT" a minute, to catch the record of the live slot
+    # having stopped matching the kernel. That only happens if something died
+    # between attaching a slot and recording it, which nothing can roll back -
+    # and until it is noticed, every block this daemon applies goes to the
+    # outgoing slot's sets, where it succeeds and blocks nothing.
+    {   name     => 'verify_slot',
+        interval => 60,
+        key      => undef,
+        run      => sub { HGFirewall->verify_slot(); },
+    },
+    {   name     => 'flush_history',
+        interval => 60,
+        key      => undef,
+        run      => sub { save_block_history() if $BLOCK_HISTORY_DIRTY; },
+    },
+);
+
+# When each task last ran.
+my %last_run;
+
+###############################################################################
+# Main
+###############################################################################
+
+sub main {
+    $CFG = HGConfig->loadconfig();
+    %config = $CFG->config();
+
+    # Testing mode clears the firewall on a timer, so a daemon that blocked an
+    # address would see its work undone minutes later. Refusing to start makes
+    # the contradiction visible rather than silent.
+    if (($config{TESTING} // 0) eq "1") {
+        print STDERR "HostGuard Pro daemon cannot start while TESTING=1. Set TESTING=0 first.\n";
+        exit(1);
+    }
+
+    unless (($config{LF_DAEMON} // 1) eq "1") {
+        print STDERR "Login failure daemon is disabled (LF_DAEMON=0).\n";
+        exit(0);
+    }
+
+    HGLogger->init(
+        file     => $config{LOG_FILE}     // "/var/log/hostguard/daemon.log",
+        level    => $config{LOG_LEVEL}    // 1,
+        max_size => $config{LOG_MAX_SIZE} // 0,
+    );
+
+    sanitise_config();
+
+    HGFirewall->init($CFG);
+
+    my $foreground = 0;
+    for my $arg (@ARGV) {
+        $foreground = 1 if $arg eq '-f' || $arg eq '--foreground';
+    }
+    daemonize() unless $foreground;
+
+    # After daemonize, so the process that survives is the one holding the
+    # lock; before write_pidfile, so the winner is the one whose pid is
+    # published.
+    acquire_lock();
+    write_pidfile();
+    load_block_history();
+    @CUSTOM_PATTERNS = HGDetect->load_custom();
+
+    # A hook named in the configuration is executed as root, so it is checked
+    # the way the firewall binaries are: absolute, root-owned, not writable by
+    # anyone else, and in a directory only root can change. Reported once at
+    # startup rather than silently skipped on every block.
+    for my $key (qw(BLOCK_REPORT PRE_SCRIPT POST_SCRIPT)) {
+        my $path = $config{$key};
+        next unless defined $path && length $path;
+        HGLogger->info("$key is set to $path")
+            if HGFirewall->safe_hook($path, $key);
+    }
+
+    HGLogger->info("HostGuard Pro daemon started (PID $$)");
+
+    my %log_handles = open_logs();
+
+    # Sockets the daemon answers as well as the logs it reads.
+    #
+    # The cluster returns a list: a dual-stack host needs one socket per
+    # address family.
+    my @cluster_socks = HGCluster->listeners(\%config);
+    my $notice_sock   = HGNotice->listener(\%config);
+
+    # Every task is treated as having just run, so none of them fires in the
+    # first cycle. A daemon that ran every check at once on startup would make
+    # a restart the most expensive thing that can happen to a loaded host.
+    my $now = time();
+    $last_run{ $_->{name} } = $now for @TASKS;
+
+    while ($RUNNING) {
+        if ($RELOAD) {
+            HGLogger->info("Reloading configuration...");
+            $CFG = HGConfig->loadconfig();
+            %config = $CFG->config();
+            sanitise_config();
+            HGFirewall->init($CFG);
+            %log_handles = open_logs();
+            @CUSTOM_PATTERNS = HGDetect->load_custom();
+            HGAlert->reset_state();
+            HGRelay->reset_state();
+
+            # The listeners may have been switched on or off, or moved.
+            close($_) for grep { $_ } @cluster_socks;
+            close($notice_sock) if $notice_sock;
+            @cluster_socks = HGCluster->listeners(\%config);
+            $notice_sock   = HGNotice->listener(\%config);
+
+            $RELOAD = 0;
+            HGLogger->info("Configuration reloaded.");
+        }
+
+        read_logs(\%log_handles);
+        service_sockets(\@cluster_socks, $notice_sock);
+        expire_counters();
+        run_due_tasks();
+
+        my $interval = $config{LF_PARSE_INTERVAL} // 3;
+        $interval = 3 unless $interval =~ /^\d+$/ && $interval > 0;
+        sleep($interval);
+    }
+
+    HGLogger->info("HostGuard Pro daemon shutting down (PID $$)");
+    close($_) for grep { $_ } @cluster_socks;
+    close($notice_sock) if $notice_sock;
+    HGRelay->flush();
+    HGAlert->reset_state();
+    save_block_history();
+    unlink($PIDFILE);
+}
+
+# Run every task whose interval has elapsed.
+#
+# Each runs inside an eval, so a check that dies - an unreadable /proc entry,
+# a filesystem that disappeared - is reported and skipped rather than taking
+# the daemon down and stopping the log reading with it.
+sub run_due_tasks {
+    my $now = time();
+
+    for my $task (@TASKS) {
+        if (defined $task->{key}) {
+            my $default = $task->{key} eq 'BLOCKLIST_ENABLE'
+                       || $task->{key} eq 'STATS_ENABLE' ? '1' : '0';
+            next unless ($config{ $task->{key} } // $default) eq '1';
+        }
+
+        my $interval = $task->{interval};
+        # An interval may be a configuration key rather than a number, so a
+        # site can decide how often the expensive checks run.
+        if ($interval !~ /^\d+$/) {
+            my $configured = $config{$interval};
+            $interval = ($configured && $configured =~ /^\d+$/ && $configured > 0)
+                      ? $configured
+                      : _default_interval($task->{interval});
+        }
+
+        next if ($now - ($last_run{ $task->{name} } // 0)) < $interval;
+        $last_run{ $task->{name} } = $now;
+
+        my $started = time();
+        eval { $task->{run}->(); 1 }
+            or HGLogger->error("Task $task->{name} failed: $@");
+
+        my $took = time() - $started;
+        HGLogger->debug("Task $task->{name} took ${took}s") if $took > 5;
+    }
+}
+
+sub _default_interval {
+    my ($key) = @_;
+    my %defaults = (
+        PROC_INTERVAL      => 300,
+        FILE_INTERVAL      => 3600,
+        WATCH_INTERVAL     => 300,
+        INTEGRITY_INTERVAL => 86400,
+    );
+    return $defaults{$key} // 300;
+}
+
+###############################################################################
+# Log reading
+###############################################################################
+
+sub read_logs {
+    my ($handles) = @_;
+
+    for my $logname (keys %$handles) {
+        my $lh = $handles->{$logname};
+        next unless $lh->{fh};
+
+        # Detect log rotation in either of its forms. A changed inode means
+        # the file was renamed and replaced. A file shorter than the current
+        # read position means it was truncated in place, as logrotate's
+        # copytruncate does, which would otherwise leave the handle seeked
+        # past the end reading nothing indefinitely.
+        my @stat = stat($lh->{file});
+        my $pos  = tell($lh->{fh});
+        if (@stat && ($stat[1] != $lh->{inode} || $stat[7] < $pos)) {
+            HGLogger->info("Log rotation detected for $lh->{file}, reopening...");
+            close($lh->{fh});
+            # Read the replacement from its start so entries written between
+            # the rotation and this check are still seen.
+            $lh = _open_log_file($lh->{file}, 0);
+            $handles->{$logname} = $lh;
+            next unless $lh->{fh};
+        }
+
+        my $fh = $lh->{fh};
+        while (my $line = <$fh>) {
+            chomp $line;
+
+            # A line longer than any real log entry is discarded rather than
+            # processed.
+            #
+            # <$fh> reads to the next newline however far away it is, so a
+            # watched file containing a very long unterminated line was slurped
+            # whole into a root daemon. Syslog truncates, but a custom pattern
+            # can point at an application log that does not, and the patterns
+            # would then be run against megabytes of it.
+            if (length($line) > $MAX_LOG_LINE) {
+                # Reported once a minute at most. Whatever is writing lines
+                # this long is writing a lot of them, and a warning per line
+                # would make the log the problem instead of the line.
+                my $now = time();
+                if ($now - $LAST_LONG_LINE_WARN >= 60) {
+                    $LAST_LONG_LINE_WARN = $now;
+                    HGLogger->log_warn("Discarded a " . length($line)
+                                     . " byte line from $lh->{file}; the limit "
+                                     . "is ${MAX_LOG_LINE} bytes. Further "
+                                     . "over-long lines will be discarded "
+                                     . "without a message for the next 60s.");
+                }
+                next;
+            }
+
+            process_line($line, $lh->{file});
+        }
+        seek($fh, 0, 1);    # clear EOF
+    }
+}
+
+# Examine one log line against everything that might care about it.
+#
+# The order is by cost: the failure patterns first because they are what the
+# daemon exists for, then the cheaper single-purpose checks.
+sub process_line {
+    my ($line, $file) = @_;
+
+    my ($service, $ip) = HGDetect->match_failure($line, \%config);
+    if (defined $service) {
+        record_failure($ip, $service, $line) if _actionable($ip);
+        return;
+    }
+
+    my ($name, $cip, $threshold) = HGDetect->match_custom($line, $file, \@CUSTOM_PATTERNS);
+    if (defined $name) {
+        record_failure($cip, $name, $line, $threshold) if _actionable($cip);
+        return;
+    }
+
+    my ($svc, $sip, $user) = HGDetect->match_success($line);
+    if (defined $svc) {
+        record_success($svc, $sip, $user);
+        return;
+    }
+
+    my ($event, $detail) = HGDetect->match_notice($line);
+    if (defined $event) {
+        report_notice($event, $detail, $line);
+        return;
+    }
+
+    HGRelay->process_line($line, \%config);
+}
+
+# True when an address can actually be acted on.
+#
+# Blocking an IPv6 address requires the IPv6 firewall to be active; without it
+# the v6 chains and ipsets do not exist, so counting towards a block that
+# cannot be applied would only fill the counter table.
+sub _actionable {
+    my ($ip) = @_;
+    return 0 unless defined $ip && HGConfig->valid_ip($ip);
+
+    if (!HGConfig->valid_ipv4($ip) && ($config{IPV6} // '0') ne '1') {
+        HGLogger->debug("Ignoring IPv6 offender $ip (IPV6=0)");
+        return 0;
+    }
+    return 1;
+}
+
+###############################################################################
+# Failure counting
+###############################################################################
+
+sub record_failure {
+    my ($ip, $service, $line, $custom_threshold) = @_;
+
+    $counters{$ip} //= { first_seen => time(), total => 0 };
+    $counters{$ip}{$service} = ($counters{$ip}{$service} // 0) + 1;
+    $counters{$ip}{total}++;
+    $counters{$ip}{last} = time();
+
+    # Keyed by source address, so with IPv6 the key space is effectively
+    # unlimited and expire_counters only clears entries older than LF_INTERVAL.
+    # $ip is being counted right now; the threshold is read from it below.
+    cap_table(\%counters, _cap('LF_TRACK_MAX_ADDRESSES', 20000),
+              'Login failure', $ip);
+
+    HGLogger->verbose("Login failure: IP=$ip service=$service "
+                    . "count=$counters{$ip}{$service} total=$counters{$ip}{total}");
+
+    # An account name in the line feeds distributed attack detection, which
+    # looks across addresses rather than within one.
+    track_distributed($ip, $line);
+
+    my $threshold = $custom_threshold;
+    unless (defined $threshold) {
+        my $key = $HGDetect::THRESHOLD{$service};
+        $threshold = defined $key ? ($config{$key} // 0) : 0;
+    }
+
+    if ($threshold > 0 && $counters{$ip}{$service} >= $threshold) {
+        block_ip($ip, "$service login failures ($counters{$ip}{$service} in window)");
+        delete $counters{$ip};
+        return;
+    }
+
+    if (($config{LF_GLOBAL_THRESHOLD} // 0) eq "1") {
+        my $global_limit = $config{LF_GLOBAL_LIMIT} // 15;
+        if ($counters{$ip}{total} >= $global_limit) {
+            block_ip($ip, "Cross-protocol failures ($counters{$ip}{total} total)");
+            delete $counters{$ip};
+            return;
+        }
+    }
+}
+
+# Detect many addresses failing against one account.
+#
+# The per-address counters cannot see this: an attacker spread across a
+# thousand hosts trips no per-address threshold, and each source looks like a
+# user who mistyped a password twice. What gives it away is the account, so
+# the addresses that attempted each account are counted per hour and the whole
+# set is blocked once too many distinct ones appear.
+sub track_distributed {
+    my ($ip, $line) = @_;
+
+    return unless ($config{LF_DISTRIBUTED} // '0') eq '1';
+
+    my $limit = $config{LF_DISTRIBUTED_LIMIT} // 25;
+    return unless $limit =~ /^\d+$/ && $limit > 0;
+
+    # The account is whatever the line names. Several shapes appear across the
+    # services; a line naming none simply cannot contribute here.
+    my $account;
+    if ($line =~ /(?:invalid user|for user|user=<?)\s*([A-Za-z0-9._\@-]{1,64})/i) {
+        $account = lc($1);
+    } elsif ($line =~ /\bfor\s+(?:invalid user\s+)?([A-Za-z0-9._\@-]{1,64})\s+from\b/) {
+        $account = lc($1);
+    }
+    return unless defined $account && length $account;
+    $account =~ s/[<>]//g;
+
+    my $now  = time();
+    my $hour = int($now / 3600);
+    my $slot = $account_attempts{$account};
+    if (!$slot || $slot->{hour} != $hour) {
+        $account_attempts{$account} = { hour => $hour, ips => {}, blocked => 0 };
+        $slot = $account_attempts{$account};
+    }
+    $slot->{last} = $now;
+
+    # Once an account has been acted on, stop recording addresses against it.
+    #
+    # The decision has already been taken and will not be taken again this
+    # hour, so every further address would be stored and never read. Without
+    # this return a blocked account accumulates every subsequent source for the
+    # rest of the hour: an unbounded set behind a decision already made.
+    return if $slot->{blocked};
+
+    $slot->{ips}{$ip} = 1;
+
+    # The account table is keyed by a name taken from a log line, which the
+    # attacker chooses. Cap it before the next insert rather than waiting for
+    # the hourly prune, which cannot help inside the hour it is flooded in.
+    # $account is being decided about; evicting it would lose the blocked
+    # flag set below and let the same attack fire again.
+    cap_table(\%account_attempts, _cap('LF_TRACK_MAX_ACCOUNTS', 2000),
+              'Account', $account);
+
+    my $distinct = scalar(keys %{ $slot->{ips} });
+    return if $distinct < $limit;
+    $slot->{blocked} = 1;
+
+    # The address set is bounded by the limit itself: it is acted on the moment
+    # it reaches it, and the early return above means it never grows further.
+
+    HGLogger->log_warn("Distributed attack on account '$account': "
+                     . "$distinct distinct addresses this hour");
+
+    # Every address that took part is blocked, not merely the one that
+    # happened to cross the threshold.
+    my $blocked = 0;
+    for my $attacker (keys %{ $slot->{ips} }) {
+        $blocked++ if block_ip($attacker,
+                               "Distributed attack on account $account "
+                             . "($distinct sources)");
+    }
+
+    HGLogger->info("Distributed attack on '$account': blocked $blocked address(es)");
+}
+
+sub block_ip {
+    my ($ip, $reason) = @_;
+
+    HGLogger->info("Blocking IP $ip - $reason");
+
+    my $now      = time();
+    my $duration = $config{LF_TEMP_BLOCK_DURATION} // 3600;
+
+    # Repeat-offender tracking. Only blocks falling inside
+    # LF_PERM_BLOCK_INTERVAL count towards promotion, so an address that
+    # offends occasionally over a long period is not banned permanently and the
+    # history file stays bounded.
+    my $window = $config{LF_PERM_BLOCK_INTERVAL} // 86400;
+    my $entry  = $block_history{$ip};
+    if ($entry && $window > 0 && ($now - ($entry->{last} // 0)) > $window) {
+        HGLogger->verbose("Block history for $ip expired, restarting count");
+        $entry = undef;
+    }
+    $block_history{$ip} = {
+        count => (($entry->{count} // 0) + 1),
+        last  => $now,
+    };
+    my $count = $block_history{$ip}{count};
+
+    # Persisted, so an unbounded table here is an unbounded file as well.
+    # $ip's history is what decides promotion to a permanent block.
+    cap_table(\%block_history, _cap('LF_TRACK_MAX_ADDRESSES', 20000),
+              'Block history', $ip);
+
+    my $perm_after = $config{LF_PERM_BLOCK_AFTER} // 3;
+    my $permanent  = ($perm_after > 0 && $count >= $perm_after) ? 1 : 0;
+    my $applied;
+
+    if ($permanent) {
+        HGLogger->info("Promoting $ip to permanent block (blocked $count times)");
+        $applied = HGFirewall->permblock($ip, "Auto-promoted: $reason (blocked $count times)");
+    } else {
+        $applied = HGFirewall->tempblock($ip, $duration, $reason);
+    }
+
+    # Marked rather than written. Writing here rewrote the whole file on every
+    # block, so the cost of blocking one address grew with the number of
+    # addresses blocked before it, which is the wrong way round during the
+    # flood that produces them. The scheduler flushes it, as does shutdown.
+    $BLOCK_HISTORY_DIRTY = 1;
+
+    # An address that was skipped - allowlisted or ignored - is not announced
+    # and is not propagated, because nothing was done to it.
+    return 0 unless $applied;
+
+    # A permanent promotion and a temporary block are different events with
+    # different advice, so they render from different templates rather than
+    # from one that has to hedge about whether the block expires.
+    HGAlert->send(
+        kind    => $permanent ? 'permblock' : 'block',
+        config  => \%config,
+        subject => $permanent ? "Permanently blocked $ip" : "Blocked $ip",
+        ident   => $ip,
+        vars    => {
+            IP       => $ip,
+            REASON   => $reason,
+            DURATION => $duration,
+            COUNT    => $count,
+        },
+        body    => "HostGuard Pro Alert\n\n"
+                 . "Hostname: " . HGAlert->hostname() . "\n"
+                 . "Time: " . localtime() . "\n"
+                 . "IP Blocked: $ip\n"
+                 . "Reason: $reason\n"
+                 . "Duration: " . ($permanent ? 'permanent' : "${duration}s") . "\n",
+    );
+
+    # Tell the rest of the cluster. Sent after the local block is applied, so
+    # a member that is slow to answer never delays protecting this host.
+    HGCluster->broadcast($permanent ? 'DENY' : 'TEMPDENY', $ip, $reason, \%config);
+
+    return 1;
+}
+
+sub expire_counters {
+    my $now      = time();
+    my $interval = $config{LF_INTERVAL} // 3600;
+
+    for my $ip (keys %counters) {
+        if ($now - $counters{$ip}{first_seen} > $interval) {
+            HGLogger->debug("Expiring counter for $ip");
+            delete $counters{$ip};
+        }
+    }
+}
+
+###############################################################################
+# Successful logins
+###############################################################################
+
+# Record a successful login, for the hourly rate limit and the login notice.
+sub record_success {
+    my ($service, $ip, $user) = @_;
+
+    if ($service eq 'sshd') {
+        HGAlert->send(
+            kind    => 'ssh_login',
+            config  => \%config,
+            subject => "SSH login by $user from $ip",
+            ident   => "$user\0$ip",
+            vars    => { USER => $user, IP => $ip },
+            body    => "An SSH session was opened.\n\n"
+                     . "Account: $user\n"
+                     . "Address: $ip\n"
+                     . "Time:    " . localtime() . "\n"
+                     . "Host:    " . HGAlert->hostname() . "\n\n"
+                     . "If this was not you, treat the account as compromised.\n",
+        );
+    }
+
+    # Mail logins are counted per address per hour. A client that authenticates
+    # hundreds of times an hour is a misconfigured mail client at best and a
+    # credential test at worst, and either wants looking at.
+    return unless $service eq 'pop3d' || $service eq 'imapd';
+
+    my $limit = $config{LOGIN_RATE_LIMIT} // 0;
+    return unless $limit =~ /^\d+$/ && $limit > 0;
+
+    my $hour = int(time() / 3600);
+    my $slot = $login_rate{$ip};
+    if (!$slot || $slot->{hour} != $hour) {
+        $login_rate{$ip} = { hour => $hour, count => 0, users => {}, acted => 0 };
+        $slot = $login_rate{$ip};
+    }
+    $slot->{count}++;
+    $slot->{last} = time();
+
+    # The account names seen from one address are shown in the report, so a
+    # handful is useful and a thousand is noise that grows without limit.
+    $slot->{users}{$user} = 1 if scalar(keys %{ $slot->{users} }) < 20;
+
+    # $ip's slot is read immediately below.
+    cap_table(\%login_rate, _cap('LF_TRACK_MAX_ADDRESSES', 20000),
+              'Login rate', $ip);
+
+    return if $slot->{count} <= $limit;
+    return if $slot->{acted};
+    $slot->{acted} = 1;
+
+    my $users = join(', ', sort keys %{ $slot->{users} });
+    HGLogger->log_warn("Address $ip has authenticated $slot->{count} times this "
+                     . "hour (limit $limit; accounts: $users)");
+
+    HGAlert->send(
+        kind    => 'login_rate',
+        config  => \%config,
+        subject => "$ip exceeded the hourly login limit",
+        ident   => "$ip\0$hour",
+        vars    => {
+            IP     => $ip,
+            COUNT  => $slot->{count},
+            LIMIT  => $limit,
+            USERS  => $users,
+            ACTION => ( ($config{LOGIN_RATE_BLOCK} // '0') eq '1'
+                        ? 'The address has been temporarily blocked.'
+                        : 'This is a report only; the address has not been '
+                        . 'blocked. Set LOGIN_RATE_BLOCK=1 to block instead.' ),
+        },
+        body    => "Address:  $ip\n"
+                 . "Logins:   $slot->{count} in the current hour\n"
+                 . "Limit:    $limit\n"
+                 . "Accounts: $users\n\n"
+                 . ( ($config{LOGIN_RATE_BLOCK} // '0') eq '1'
+                     ? "The address has been temporarily blocked.\n"
+                     : "This is a report only; the address has not been blocked. "
+                     . "Set LOGIN_RATE_BLOCK=1 to block instead.\n" ),
+    );
+
+    if (($config{LOGIN_RATE_BLOCK} // '0') eq '1') {
+        block_ip($ip, "Exceeded $limit mail logins in one hour");
+    }
+}
+
+# Report an event that is never counted or blocked on.
+sub report_notice {
+    my ($event, $detail, $line) = @_;
+
+    my %spec = (
+        su_fail   => ['su_login',  'Failed su attempt'],
+        su_ok     => ['su_login',  'Successful su'],
+        whm_root  => ['whm_root',  'WHM root login'],
+        port_scan => ['port_scan', 'Port scan blocked'],
+    );
+    my $spec = $spec{$event} or return;
+    my ($kind, $title) = @$spec;
+
+    # The scan report names the address the kernel blocked, which the pattern
+    # captured from the log line.
+    if ($event eq 'port_scan') {
+        my ($ip) = $detail =~ /((?:\d{1,3}\.){3}\d{1,3})/;
+        return unless defined $ip && HGConfig->valid_ip($ip);
+        HGLogger->info("Port scan blocked: $ip");
+        HGAlert->send(
+            kind    => 'port_scan',
+            config  => \%config,
+            subject => "Port scan from $ip",
+            ident   => $ip,
+            vars    => { IP => $ip },
+            body    => "A port scan was blocked.
+
+"
+                     . "Address: $ip
+"
+                     . "Time:    " . localtime() . "
+"
+                     . "Host:    " . HGAlert->hostname() . "
+
+"
+                     . "The block expires on its own. Remove it now with:
+"
+                     . "  hostguard -tr $ip
+",
+        );
+        return;
+    }
+
+    HGLogger->info("$title: $detail");
+
+    HGAlert->send(
+        kind    => $kind,
+        config  => \%config,
+        subject => "$title: $detail",
+        ident   => "$event\0$detail",
+        vars    => { TITLE => $title, DETAIL => $detail, LOGLINE => $line },
+        body    => "$title\n\n"
+                 . "Detail: $detail\n"
+                 . "Time:   " . localtime() . "\n"
+                 . "Host:   " . HGAlert->hostname() . "\n\n"
+                 . "Log line:\n  $line\n",
+    );
+}
+
+###############################################################################
+# Sockets
+###############################################################################
+
+# Longest one pass of socket servicing may take, in seconds.
+#
+# The log reading this loop also does is what the whole daemon exists for, so
+# answering sockets is not allowed to starve it however many connections
+# arrive. See service_sockets.
+my $SOCKET_PASS_BUDGET = 3;
+
+# Answer anything waiting on the cluster or notice sockets.
+#
+# select is given a zero timeout: the daemon has already slept for the parse
+# interval and must not sleep again here, or the log reading would fall behind
+# whenever nothing connects.
+sub service_sockets {
+    my ($clusters, $notice) = @_;
+
+    my @cluster = grep { $_ } @{ $clusters || [] };
+    return unless @cluster || $notice;
+
+    my $rin = '';
+    vec($rin, fileno($_), 1) = 1 for @cluster;
+    vec($rin, fileno($notice), 1) = 1 if $notice;
+
+    # Bounded twice: by the number of connections and by the clock.
+    #
+    # The count alone was not a bound on anything that matters. Each connection
+    # could take up to five seconds - a blocking read under alarm(5) - so fifty
+    # of them was four minutes of main loop, and both listeners are reachable
+    # by hostile peers: the notice responder answers addresses the firewall has
+    # already blocked, and a cluster member is a host that can be compromised.
+    # For the duration nothing else ran: no log reading, so no new attack from
+    # any source was noticed; no expiry; no scheduled task.
+    #
+    # Both listeners now use non-blocking sockets with a one second deadline of
+    # their own, so this is a second bound rather than the only one. A pass that
+    # runs out of time leaves the remaining connections pending; select will
+    # report them again on the next cycle, a parse interval later.
+    my $deadline = time() + $SOCKET_PASS_BUDGET;
+    my $handled  = 0;
+
+    for (1 .. 50) {
+        last if time() >= $deadline;
+
+        my $ready = select(my $rout = $rin, undef, undef, 0);
+        last unless defined $ready && $ready > 0;
+
+        for my $sock (@cluster) {
+            next unless vec($rout, fileno($sock), 1);
+            last if time() >= $deadline;
+            my ($msg) = HGCluster->accept_message($sock, \%config);
+            $handled++;
+            apply_cluster_message($msg) if $msg;
+        }
+        if ($notice && vec($rout, fileno($notice), 1) && time() < $deadline) {
+            HGNotice->serve($notice, \%config);
+            $handled++;
+        }
+    }
+
+    HGLogger->log_warn("Socket servicing used its whole ${SOCKET_PASS_BUDGET}s "
+                     . "budget after $handled connection(s); the rest are "
+                     . "deferred to the next cycle. Something is opening a lot "
+                     . "of connections to the notice or cluster port.")
+        if $handled && time() >= $deadline;
+}
+
+# Act on an authenticated message from another cluster member.
+#
+# The message has already been shown to come from a configured member and to
+# carry a valid signature. Nothing is broadcast onward: a member applies what
+# it is told and stops there, so a block cannot loop around the cluster.
+sub apply_cluster_message {
+    my ($msg) = @_;
+
+    my $reason = length $msg->{reason} ? $msg->{reason} : 'cluster';
+
+    # Each of these reports whether it reached the running firewall. A member
+    # that could not apply what it was told must not then report success: the
+    # point of the cluster is that a block on one host means a block on all of
+    # them, and a silent failure here breaks exactly that.
+    my $applied = 0;
+    if ($msg->{action} eq 'DENY') {
+        $applied = HGFirewall->permblock($msg->{ip}, "Cluster: $reason");
+    } elsif ($msg->{action} eq 'TEMPDENY') {
+        my $duration = $config{LF_TEMP_BLOCK_DURATION} // 3600;
+        $applied = HGFirewall->tempblock($msg->{ip}, $duration, "Cluster: $reason");
+    } elsif ($msg->{action} eq 'ALLOW') {
+        $applied = HGFirewall->allow($msg->{ip}, "Cluster: $reason");
+    } elsif ($msg->{action} eq 'UNBLOCK') {
+        $applied = HGFirewall->tempunblock($msg->{ip});
+    } elsif ($msg->{action} eq 'PING') {
+        HGLogger->debug("Cluster ping received");
+        return;
+    }
+
+    unless ($applied) {
+        HGLogger->error("Cluster: $msg->{action} for $msg->{ip} was NOT applied "
+                      . "on this host. It remains in force on the member that "
+                      . "sent it, so the cluster is out of step.");
+        return;
+    }
+
+    HGAlert->send(
+        kind    => 'cluster',
+        config  => \%config,
+        subject => "Cluster $msg->{action} for $msg->{ip}",
+        ident   => "$msg->{action}\0$msg->{ip}",
+        vars    => {
+            ACTION => $msg->{action},
+            IP     => $msg->{ip},
+            REASON => $reason,
+        },
+        body    => "A cluster member asked this host to apply a change.\n\n"
+                 . "Action:  $msg->{action}\n"
+                 . "Address: $msg->{ip}\n"
+                 . "Reason:  $reason\n",
+    );
+}
+
+###############################################################################
+# Periodic task bodies
+###############################################################################
+
+# Download any block list that has fallen due and swap the new contents into
+# the running firewall.
+sub refresh_blocklists {
+    my $cfg = eval { HGConfig->loadconfig() } or return;
+
+    my @updated = eval { HGBlocklist->refresh_due($cfg) };
+    if ($@) {
+        HGLogger->error("Block list refresh failed: $@");
+        return;
+    }
+
+    # The download and the apply are two different things, and only the first
+    # has happened by this point. The new copy is on disk, so "hostguard -b"
+    # and the WHM page will both call the list up to date; if applying it to
+    # the running firewall then fails, the kernel goes on matching the old
+    # data and nothing says so unless it is said here.
+    for my $name (@updated) {
+        my $applied = eval { HGFirewall->refresh_blocklist_set($name) };
+        if ($@) {
+            HGLogger->error("Cannot apply block list $name: $@");
+            next;
+        }
+        next if $applied;
+
+        HGLogger->error("Block list $name was downloaded but not applied to "
+                      . "the running firewall, which still has the previous "
+                      . "data for it. The reason is above; 'hostguard -r' "
+                      . "rebuilds from the cached copy.");
+    }
+}
+
+# Refresh country zone files and swap them into the live sets.
+sub refresh_geo {
+    my @updated = eval { HGGeo->refresh_due(\%config) };
+    if ($@) {
+        HGLogger->error("Country zone refresh failed: $@");
+        return;
+    }
+
+    for my $cc (@updated) {
+        for my $family ('inet', 'inet6') {
+            next if $family eq 'inet6' && ($config{IPV6} // '0') ne '1';
+
+            my $applied = eval { HGFirewall->refresh_geo_set($cc, $family) };
+            if ($@) {
+                HGLogger->error("Cannot apply country $cc: $@");
+                next;
+            }
+            next if $applied;
+
+            # As with the block lists: the zone file is newer than what the
+            # firewall is matching on, and only this says so.
+            HGLogger->error("Country $cc ($family) was downloaded but not "
+                          . "applied to the running firewall, which still has "
+                          . "the previous ranges for it. The reason is above; "
+                          . "'hostguard -r' rebuilds from the cached copy.");
+        }
+    }
+}
+
+sub record_statistics {
+    my @blocks = HGFirewall->list_tempblocks();
+    my $active = grep { $_->{active} } @blocks;
+    HGSystem->record_sample(\%config, blocks => $active);
+}
+
+# Drop in-memory tables that can only grow.
+#
+# The counters expire on their own schedule; these are the per-hour tables,
+# which would otherwise accumulate an entry per address and per account for as
+# long as the daemon runs.
+sub prune_state {
+    my $hour = int(time() / 3600);
+
+    for my $ip (keys %login_rate) {
+        delete $login_rate{$ip} if $login_rate{$ip}{hour} < $hour;
+    }
+    for my $account (keys %account_attempts) {
+        delete $account_attempts{$account} if $account_attempts{$account}{hour} < $hour;
+    }
+
+    HGLogger->debug("Pruned per-hour state: "
+                  . scalar(keys %login_rate) . " login rate, "
+                  . scalar(keys %account_attempts) . " account entries retained");
+}
+
+###############################################################################
+# Log file management
+###############################################################################
+
+sub open_logs {
+    my %handles;
+    my %opened;
+
+    # The files named by the standard configuration keys.
+    for my $key (@HGDetect::LOG_KEYS) {
+        my $file = $config{$key};
+        next unless $file && -f $file;
+        next if $opened{$file}++;
+
+        my $lh = _open_log_file($file);
+        if ($lh->{fh}) {
+            $handles{$key} = $lh;
+            HGLogger->info("Monitoring log: $file");
+        }
+    }
+
+    # Any additional file named only by a custom pattern.
+    for my $p (@CUSTOM_PATTERNS) {
+        next unless -f $p->{file};
+        next if $opened{ $p->{file} }++;
+
+        my $lh = _open_log_file($p->{file});
+        if ($lh->{fh}) {
+            $handles{"custom:$p->{name}"} = $lh;
+            HGLogger->info("Monitoring log: $p->{file} (custom pattern $p->{name})");
+        }
+    }
+
+    unless (keys %handles) {
+        HGLogger->log_warn("No log files found to monitor!");
+    }
+
+    return %handles;
+}
+
+sub _open_log_file {
+    my ($file, $seek_to_end) = @_;
+    $seek_to_end = 1 unless defined $seek_to_end;
+    my %lh = (file => $file, fh => undef, inode => 0);
+
+    open(my $fh, '<', $file) or do {
+        HGLogger->log_warn("Cannot open log file: $file: $!");
+        return \%lh;
+    };
+
+    # On first open, skip the existing backlog and watch only new lines. A
+    # file opened after rotation starts from the beginning instead.
+    seek($fh, 0, $seek_to_end ? 2 : 0);
+
+    my @stat = stat($file);
+    $lh{fh}    = $fh;
+    $lh{inode} = $stat[1] // 0;
+
+    return \%lh;
+}
+
+###############################################################################
+# Block history persistence
+###############################################################################
+
+sub _history_file { return "$DATA_DIR/block_history.dat"; }
+
+# Serialise everything that touches the history file.
+#
+# The lock is taken on a file beside the data rather than on the data itself.
+# A writer replaces the data file by rename, so a lock held on that inode is a
+# lock on a file that is about to stop being the one other processes open, and
+# two writers can each hold "the file" while meaning different inodes.
+#
+# LOCK_NB with a short retry rather than a blocking wait: this runs inside the
+# daemon's main loop, and a lock left held by something wedged must cost a
+# flush rather than the log reading that everything else depends on. Giving up
+# leaves $BLOCK_HISTORY_DIRTY set, so the next flush tries again.
+sub _history_lock {
+    my ($mode) = @_;
+    my $lockfile = _history_file() . '.lock';
+
+    my $fh;
+    unless (sysopen($fh, $lockfile, O_WRONLY | O_CREAT, 0600)) {
+        HGLogger->log_warn("Cannot open $lockfile: $!");
+        return undef;
+    }
+
+    for my $attempt (1 .. 10) {
+        return $fh if flock($fh, $mode | LOCK_NB);
+        # A tenth of a second, without sleep()'s one second granularity and
+        # without disturbing any alarm the caller has set.
+        select(undef, undef, undef, 0.1);
+    }
+
+    HGLogger->log_warn("Could not lock $lockfile; another process is holding it");
+    close($fh);
+    return undef;
+}
+
+# fsync a handle, reporting whether the data reached the disk.
+#
+# IO::Handle::sync is unimplemented on a few platforms and croaks there rather
+# than returning false, so the call is wrapped. An unavailable fsync is not
+# treated as a failed write: it means the guarantee is weaker, not that
+# anything is wrong with what was written.
+sub _fsync {
+    my ($fh) = @_;
+    my $ok  = eval { $fh->sync(); 1 };
+    return 1 if $ok;
+    return 1 if $@;    # no fsync on this platform
+    HGLogger->log_warn("fsync failed while saving block history: $!");
+    return 0;
+}
+
+sub load_block_history {
+    my $file = _history_file();
+    return unless -f $file;
+
+    # A reader that does not take the lock can open the inode a writer is part
+    # way through replacing, and read a file that is about to be unlinked.
+    # Failing to lock is not fatal here: starting with no history costs repeat
+    # offenders their counts, and is better than not starting.
+    my $lock = _history_lock(LOCK_SH);
+
+    my $now    = time();
+    my $window = $config{LF_PERM_BLOCK_INTERVAL} // 86400;
+    my $max    = _cap('LF_TRACK_MAX_ADDRESSES', 20000);
+
+    my $dropped = 0;
+    my $damaged = 0;
+
+    if (open(my $fh, '<', $file)) {
+        while (my $line = <$fh>) {
+            chomp $line;
+            next unless length $line;
+
+            my ($ip, $count, $last) = split(/\|/, $line, 3);
+
+            # The file is only ever written from this table, so a line that
+            # does not parse is damage - a truncated write by an older
+            # release, a half-written file recovered by fsck, an edit by hand
+            # - and is dropped rather than guessed at.
+            unless (defined $ip && HGConfig->valid_ip($ip)
+                    && defined $count && $count =~ /^\d+$/ && $count > 0) {
+                $damaged++;
+                next;
+            }
+
+            # An entry without a timestamp is treated as just seen, so it ages
+            # out from now rather than being discarded immediately.
+            $last = $now unless defined $last && $last =~ /^\d+$/;
+            # A timestamp in the future would never expire. It comes from a
+            # clock since corrected, so it is pulled back to now.
+            $last = $now if $last > $now;
+            next if $window > 0 && ($now - $last) > $window;
+
+            # The cap that bounds the table in memory has to bound what is
+            # read back into it, or a file grown by an earlier release
+            # reintroduces the growth on the next start - before any of the
+            # pruning that would have trimmed it has had a chance to run.
+            if (!exists $block_history{$ip} && scalar(keys %block_history) >= $max) {
+                $dropped++;
+                next;
+            }
+
+            $block_history{$ip} = { count => $count, last => $last };
+        }
+        close($fh);
+    }
+
+    close($lock) if $lock;
+
+    HGLogger->log_warn("Block history file holds more than $max entries; "
+                     . "$dropped ignored")
+        if $dropped;
+    HGLogger->log_warn("Block history file had $damaged unreadable line(s); "
+                     . "they were discarded")
+        if $damaged;
+}
+
+# Write the table out, replacing what is on disk.
+#
+# Returns true when the new file is in place. Three things have to hold for
+# that, and none of them can be assumed:
+#
+#   the write succeeded     print and close were unchecked, so a full disk
+#                           produced a short file that was then renamed over a
+#                           good one
+#   the data is on disk     rename is atomic with respect to the writes the
+#                           kernel has recorded, which is not the same as the
+#                           writes the process has issued; without fsync a
+#                           crash can leave the new name pointing at a file of
+#                           zeroes
+#   nobody else is writing  the temporary file had a fixed name, so a second
+#                           writer wrote into the same one, and the lock taken
+#                           on it was taken after the open had already
+#                           truncated whatever was there
+#
+# The dirty flag is cleared only on success. Clearing it up front lost every
+# block recorded since the last flush whenever the write failed, which is
+# precisely when the record needs to survive so the next flush can retry.
+sub save_block_history {
+    my $file   = _history_file();
+    my $now    = time();
+    my $window = $config{LF_PERM_BLOCK_INTERVAL} // 86400;
+
+    my $lock = _history_lock(LOCK_EX);
+    return 0 unless $lock;
+
+    # Unique to this process, so a second writer - or a temporary file left
+    # behind by one that was killed - is never mistaken for ours.
+    my $tmp = "$file.$$.tmp";
+
+    my $fh;
+    unless (sysopen($fh, $tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600)) {
+        HGLogger->error("Cannot write block history to $tmp: $!");
+        close($lock);
+        return 0;
+    }
+
+    my $ok      = 1;
+    my $written = 0;
+    my $err     = '';
+
+    for my $ip (keys %block_history) {
+        my $e = $block_history{$ip};
+        next unless ref $e eq 'HASH';
+        my $count = $e->{count};
+        my $last  = $e->{last} // 0;
+        next unless defined $count && $count =~ /^\d+$/;
+        next unless $last =~ /^\d+$/;
+        next if $window > 0 && ($now - $last) > $window;
+
+        unless (print $fh "$ip|$count|$last\n") {
+            $err = "$!";
+            $ok  = 0;
+            last;
+        }
+        $written++;
+    }
+
+    $ok = 0 if $ok && !_fsync($fh);
+
+    # Buffered output is flushed by close, so a failure there is a failed
+    # write like any other rather than a tidy-up detail.
+    unless (close($fh)) {
+        $err ||= "$!";
+        $ok = 0;
+    }
+
+    if ($ok && !rename($tmp, $file)) {
+        $err = "$!";
+        $ok  = 0;
+    }
+
+    unless ($ok) {
+        unlink($tmp);
+        close($lock);
+        $err = 'write failed' unless length $err;
+        HGLogger->error("Block history not saved, keeping the previous copy: $err");
+        return 0;
+    }
+
+    # The rename is only durable once the directory entry is. Best effort: if
+    # this cannot be done the file is still complete and correct, only its
+    # arrival is not guaranteed across a power loss.
+    if (opendir(my $dh, $DATA_DIR)) {
+        eval { IO::Handle::sync($dh) };
+        closedir($dh);
+    }
+
+    $BLOCK_HISTORY_DIRTY = 0;
+    close($lock);
+
+    HGLogger->verbose("Block history saved: $written entries");
+    return 1;
+}
+
+###############################################################################
+# Daemonize
+###############################################################################
+
+sub daemonize {
+    defined(my $pid = fork()) or die "Cannot fork: $!\n";
+    exit(0) if $pid;
+
+    setsid() or die "Cannot setsid: $!\n";
+
+    # Fork again to prevent acquiring a controlling terminal
+    defined($pid = fork()) or die "Cannot fork: $!\n";
+    exit(0) if $pid;
+
+    open(STDIN,  '<', '/dev/null') or die "Cannot redirect STDIN: $!\n";
+    open(STDOUT, '>>', $config{LOG_FILE} // '/var/log/hostguard/daemon.log')
+        or die "Cannot redirect STDOUT: $!\n";
+    open(STDERR, '>>&', \*STDOUT) or die "Cannot redirect STDERR: $!\n";
+
+    chdir('/');
+    umask(0027);
+}
+
+# Held open for the life of the process. Closing it releases the lock, so the
+# handle has to outlive the sub that took it.
+my $LOCK_FH;
+
+# Take the single-instance lock, or exit.
+#
+# The daemon can be started by systemd, by "hostguard --start-daemon", or by
+# being run directly, and nothing about those three prevents two of them being
+# in effect at once. Two daemons tail the same logs, block the same addresses
+# and write the same state files, so the counters and the alert suppression
+# state end up describing neither of them.
+#
+# An exclusive lock settles it wherever the start came from. The lock is a
+# separate file from the pid file because the pid file is rewritten on every
+# start, and a lock on a file that is about to be replaced protects nothing.
+sub acquire_lock {
+    my $lockfile = "$DATA_DIR/hostguardd.lock";
+
+    unless (sysopen($LOCK_FH, $lockfile, O_WRONLY | O_CREAT, 0600)) {
+        print STDERR "Cannot open $lockfile: $!\n";
+        exit(1);
+    }
+
+    unless (flock($LOCK_FH, LOCK_EX | LOCK_NB)) {
+        my $other = 'another process';
+        if (open(my $fh, '<', $PIDFILE)) {
+            my $pid = <$fh>;
+            close($fh);
+            chomp $pid if defined $pid;
+            $other = "PID $pid" if defined $pid && $pid =~ /^\d+$/;
+        }
+        print STDERR "HostGuard Pro daemon is already running ($other).\n";
+        print STDERR "Refusing to start a second one: two daemons would block "
+                   . "the same addresses and\nwrite the same state files.\n";
+        exit(1);
+    }
+
+    # Not closed on exec, so a child cannot hold the lock open after the daemon
+    # has gone.
+    eval { require Fcntl; fcntl($LOCK_FH, Fcntl::F_SETFD(), Fcntl::FD_CLOEXEC()) };
+
+    return 1;
+}
+
+sub write_pidfile {
+    open(my $fh, '>', $PIDFILE) or die "Cannot write PID file $PIDFILE: $!\n";
+    print $fh "$$\n";
+    close($fh);
+}
+
+###############################################################################
+# Debug state dump (on SIGUSR1)
+###############################################################################
+
+sub dump_state {
+    HGLogger->info("=== STATE DUMP ===");
+    HGLogger->info("Active IP counters: " . scalar(keys %counters));
+    for my $ip (sort keys %counters) {
+        my $c = $counters{$ip};
+        HGLogger->info("  $ip: total=$c->{total} age=" . (time() - $c->{first_seen}) . "s");
+    }
+
+    HGLogger->info("Block history entries: " . scalar(keys %block_history));
+    for my $ip (sort keys %block_history) {
+        my $e = $block_history{$ip};
+        next unless ref $e eq 'HASH';
+        HGLogger->info("  $ip: blocks=$e->{count} last=" . (time() - $e->{last}) . "s ago");
+    }
+
+    HGLogger->info("Login rate entries: " . scalar(keys %login_rate)
+                 . " (cap " . _cap('LF_TRACK_MAX_ADDRESSES', 20000) . ")");
+    HGLogger->info("Accounts under attack: " . scalar(keys %account_attempts)
+                 . " (cap " . _cap('LF_TRACK_MAX_ACCOUNTS', 2000) . ")");
+    HGLogger->info("Custom patterns loaded: " . scalar(@CUSTOM_PATTERNS));
+
+    HGLogger->info("Task last-run times:");
+    for my $task (@TASKS) {
+        my $ago = time() - ($last_run{ $task->{name} } // 0);
+        HGLogger->info("  $task->{name}: ${ago}s ago");
+    }
+    HGLogger->info("=== END STATE DUMP ===");
+}
+
+###############################################################################
+# Run
+###############################################################################
+main();

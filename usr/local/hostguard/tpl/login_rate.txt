@@ -1,0 +1,23 @@
+HostGuard Pro - Excessive Logins
+==================================
+
+Server:   [HOSTNAME]
+Time:     [TIME]
+
+Address:  [IP]
+Logins:   [COUNT] in the current hour
+Limit:    [LIMIT]
+Accounts: [USERS]
+
+[ACTION]
+
+An address authenticating this often is usually a mail client polling
+far too frequently. It can also be someone working through a list of
+stolen credentials, which looks identical from the logs except that the
+account names vary.
+
+If the accounts above are all the same, suspect a misconfigured client.
+If they vary, suspect credential testing.
+
+--
+HostGuard Pro - https://fasthive.com/

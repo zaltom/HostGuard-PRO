@@ -1,0 +1,24 @@
+HostGuard Pro - Watched Path Changed
+==================================
+
+Server:   [HOSTNAME]
+Time:     [TIME]
+
+Changes:  [COUNT]
+
+[CHANGES]
+
+These paths are listed in /etc/hostguard/watch.conf, so something you
+asked to be told about has changed.
+
+A file is compared by size, mtime, mode, ownership and content digest;
+a directory by its immediate entries. "changed" means one of those
+differs from the recorded baseline, not necessarily that the contents
+were edited: a replaced file with identical contents still changes its
+inode metadata.
+
+The new state is now the baseline, so this is reported once per change
+rather than on every check.
+
+--
+HostGuard Pro - https://fasthive.com/

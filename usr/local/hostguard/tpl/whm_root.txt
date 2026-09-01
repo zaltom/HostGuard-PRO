@@ -1,0 +1,21 @@
+HostGuard Pro - WHM Root Access
+==================================
+
+Server:   [HOSTNAME]
+Time:     [TIME]
+
+Event:    [TITLE]
+Detail:   [DETAIL]
+
+Log line:
+  [LOGLINE]
+
+Someone logged into WHM as root. This account can change every setting
+on the server, including this firewall.
+
+If this was not you or a colleague, treat it as a compromise of the
+root password rather than as a suspicious login: whoever did this
+already has full control.
+
+--
+HostGuard Pro - https://fasthive.com/

@@ -1,0 +1,22 @@
+HostGuard Pro - Port Scan Detected
+==================================
+
+Server:   [HOSTNAME]
+Time:     [TIME]
+
+Address:  [IP]
+
+This address connected to more closed ports than SCAN_LIMIT allows
+within SCAN_INTERVAL, so the kernel added it to the temporary block
+set. The block expires on its own.
+
+Only traffic that matched no open port is counted, so ordinary clients
+do not trigger this. A single scan is background noise on any public
+address; a scan followed by authentication failures is worth reading
+together.
+
+To remove the block:
+  hostguard -tr [IP]
+
+--
+HostGuard Pro - https://fasthive.com/

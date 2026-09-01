@@ -1,0 +1,28 @@
+HostGuard Pro - Excessive Process Usage
+==================================
+
+Server:   [HOSTNAME]
+Time:     [TIME]
+
+PID:      [PID]
+User:     [USER]
+Command:  [COMMAND]
+Binary:   [BINARY]
+CPU:      [CPU]%
+Memory:   [MEMORY] KB
+Running:  [RUNTIME]s
+
+Over limit:
+  [REASON]
+
+Action taken: [ACTION]
+
+The process had been running longer than PROC_USAGE_TIME before it was
+considered, so this is sustained usage rather than a startup spike.
+
+HostGuard Pro sends SIGTERM at most, never SIGKILL. A process that
+ignores SIGTERM is left alone deliberately: deciding to kill it outright
+is a judgement about what it was doing, which a monitor cannot make.
+
+--
+HostGuard Pro - https://fasthive.com/

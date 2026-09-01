@@ -1,0 +1,22 @@
+# Runtime state and logs, created on the target host by install.sh.
+# The tracked .empty files keep the directories present in the repository.
+var/lib/hostguard/*
+!var/lib/hostguard/.empty
+var/log/hostguard/*
+!var/log/hostguard/.empty
+
+# Copies install.sh leaves behind when it preserves an existing config.
+*.dist
+
+# Editor and OS scratch files
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local regression suite. Kept out of the repository deliberately: it is a
+# development aid, not part of what gets installed on a host.
+t/

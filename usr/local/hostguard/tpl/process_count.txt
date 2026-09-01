@@ -1,0 +1,21 @@
+HostGuard Pro - Excessive User Processes
+==================================
+
+Server:   [HOSTNAME]
+Time:     [TIME]
+
+Account:   [USER]
+Processes: [COUNT]
+Limit:     [LIMIT]
+Example:   [EXAMPLE]
+
+This is a report only; no process has been terminated.
+
+A count well above the account's normal working range is usually a
+runaway script or a process that is failing and being restarted in a
+loop. A count that climbs steadily is worth acting on sooner: a fork
+bomb reaches the system process limit and then affects every account,
+not only this one.
+
+--
+HostGuard Pro - https://fasthive.com/

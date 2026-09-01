@@ -1,0 +1,14 @@
+# These files are deployed to Linux servers and are executed directly.
+# CRLF line endings would break the shebang lines, so keep everything LF
+# regardless of the checkout platform or core.autocrlf.
+* text=auto eol=lf
+
+*.sh        text eol=lf
+*.pm        text eol=lf
+*.cgi       text eol=lf
+*.conf      text eol=lf
+*.service   text eol=lf
+*.logrotate text eol=lf
+
+usr/local/hostguard/bin/hostguard  text eol=lf
+usr/local/hostguard/bin/hostguardd text eol=lf

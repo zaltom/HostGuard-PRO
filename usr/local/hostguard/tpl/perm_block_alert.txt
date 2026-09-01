@@ -1,0 +1,26 @@
+HostGuard Pro - IP Permanently Blocked
+==================================
+
+Server:   [HOSTNAME]
+Time:     [TIME]
+
+IP Address: [IP]
+Reason:     [REASON]
+Blocked:    [COUNT] times within the promotion window
+
+This address has been blocked repeatedly, so it has been promoted to a
+permanent block and written to:
+  /etc/hostguard/deny.conf
+
+Unlike a temporary block, this one does not expire. It stays in force
+until it is removed by hand.
+
+To remove it, delete the line for this address from deny.conf and
+reload:
+  hostguard -r
+
+To allow it instead, which also removes any block:
+  hostguard -a [IP] "Trusted IP"
+
+--
+HostGuard Pro - https://fasthive.com/

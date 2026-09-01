@@ -1,0 +1,19 @@
+/var/log/hostguard/daemon.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+    postrotate
+        # systemctl, not a pid from a file.
+        #
+        # kill -HUP $(cat /run/hostguardd.pid) signals whatever holds that
+        # number. A pid file outlives the process that wrote it, so after an
+        # unclean daemon exit the number eventually belongs to something else -
+        # and this runs weekly, as root. The CLI has _pid_is_daemon for exactly
+        # this reason; systemctl resolves the unit and needs no such check.
+        /bin/systemctl reload hostguardd.service 2>/dev/null || true
+    endscript
+}

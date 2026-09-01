@@ -1,0 +1,25 @@
+HostGuard Pro - IP Blocked
+==================================
+
+Server:   [HOSTNAME]
+Time:     [TIME]
+
+IP Address: [IP]
+Reason:     [REASON]
+Duration:   [DURATION] seconds
+
+This address has been temporarily blocked by the HostGuard Pro login
+failure daemon. The block expires on its own when the duration above
+has elapsed.
+
+If this is a false positive, remove the block now with:
+  hostguard -tr [IP]
+
+To stop it being blocked again, add it to the allowlist:
+  hostguard -a [IP] "Trusted IP"
+
+Or allow it for a bounded period only:
+  hostguard -ta [IP] 86400 "Temporary access"
+
+--
+HostGuard Pro - https://fasthive.com/

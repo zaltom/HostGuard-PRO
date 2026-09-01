@@ -1,0 +1,23 @@
+HostGuard Pro - High Load Average
+==================================
+
+Server:   [HOSTNAME]
+Time:     [TIME]
+
+Load:     [LOAD1] (1m), [LOAD5] (5m), [LOAD15] (15m)
+Limit:    [LIMIT]
+Above:    [ELAPSED]s (reporting threshold [REQUIRED]s)
+
+Highest CPU processes
+
+[PROCESSES]
+
+The load has stayed above the limit for the whole period above, so this
+is sustained rather than a spike. A backup, a queue run or a package
+update raises load briefly and is not reported.
+
+Compare the 1, 5 and 15 minute figures: rising left to right means the
+load is climbing, falling means it is already recovering.
+
+--
+HostGuard Pro - https://fasthive.com/
