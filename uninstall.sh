@@ -76,7 +76,9 @@ fi
 # Confirm
 echo ""
 echo "This will completely remove HostGuard Pro from this server."
-echo "Configuration files will be backed up to /root/hostguard_backup/"
+echo "Configuration and the daemon log will be backed up to"
+echo "/root/hostguard_backup/ - the log is the only record of what was"
+echo "blocked and of policy changes made through WHM."
 echo ""
 read -p "Continue? (y/N): " CONFIRM
 if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
@@ -279,13 +281,32 @@ rm -f /usr/local/cpanel/whostmgr/addonfeatures/hostguard
 log_info "Backing up configuration..."
 
 BACKUP_DIR="/root/hostguard_backup/$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$BACKUP_DIR"
+mkdir -p "$BACKUP_DIR/config" "$BACKUP_DIR/log"
 # The backup contains cluster.key. cp -a preserves its 0600, but the
 # directories above it are created with whatever umask is in force, so they are
 # tightened explicitly rather than left to it.
-chmod 700 /root/hostguard_backup "$BACKUP_DIR"
-cp -a /etc/hostguard/* "$BACKUP_DIR/" 2>/dev/null || true
-log_info "Config backed up to: $BACKUP_DIR"
+chmod 700 /root/hostguard_backup "$BACKUP_DIR" \
+          "$BACKUP_DIR/config" "$BACKUP_DIR/log"
+
+# Dotfiles as well as the rest: a bare * misses anything beginning with a dot,
+# and this is the only copy being taken.
+cp -a /etc/hostguard/. "$BACKUP_DIR/config/" 2>/dev/null || true
+
+# The log goes with it.
+#
+# Everything below removes /var/log/hostguard, and that directory is the only
+# record of what this firewall blocked and why, of every policy change made
+# through WHM - which the CGI writes there with the account and the source
+# address - and of every integrity, account-change and process finding. It was
+# deleted and not backed up, so an uninstall destroyed the audit trail as a
+# side effect of tidying up, and anyone who reached root could destroy it with
+# one supported command that looks like housekeeping.
+if [ -d /var/log/hostguard ]; then
+    cp -a /var/log/hostguard/. "$BACKUP_DIR/log/" 2>/dev/null || true
+    log_info "Daemon log backed up to: $BACKUP_DIR/log"
+fi
+
+log_info "Config backed up to: $BACKUP_DIR/config"
 
 ###############################################################################
 # Remove files
@@ -347,7 +368,7 @@ else
     log_warn "Nothing is filtering this host now unless another firewall is"
     log_warn "configured. Check with: iptables -S | head"
 fi
-log_info "Configuration backup: $BACKUP_DIR"
+log_info "Backup (configuration and daemon log): $BACKUP_DIR"
 echo ""
 log_warn "If you had other firewall software, you may need to restart it."
 echo ""

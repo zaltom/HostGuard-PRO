@@ -55,7 +55,17 @@ sub _log {
     my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
     my $line = "[$ts] [$level] $msg\n";
 
-    open(my $fh, '>>', $LOG_FILE) or return;
+    # The mode is stated rather than inherited from the caller's umask.
+    #
+    # The installer creates daemon.log as 0640, but rotation replaces it, and
+    # whichever process logs first afterwards was the one deciding the mode.
+    # The daemon sets umask(0027) and got 0640; the CLI and the WHM CGI set
+    # none, so a root shell with the usual umask 022 produced a world-readable
+    # log holding blocked addresses, account names taken from authentication
+    # logs, and the WHM policy-change audit trail. /var/log/hostguard is 0750,
+    # so nothing could reach it - but that is the directory's guarantee, not
+    # this file's, and only one of the two is stated here.
+    sysopen(my $fh, $LOG_FILE, O_WRONLY | O_APPEND | O_CREAT, 0640) or return;
     flock($fh, LOCK_EX);
     print $fh $line;
     close($fh);

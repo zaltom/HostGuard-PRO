@@ -310,12 +310,46 @@ done
 log_step "Probing iptables matches..."
 
 HG_PROBE="_hg_probe_$$"
+HG_NAT_PROBE="_hg_nat_$$"
+HG6_PROBE="_hg6_probe_$$"
+
+# Remove the scratch objects however this script leaves.
+#
+# The probes create a chain in the filter table, one in nat, one in ip6tables
+# and a scratch ipset, and each was removed only on the path where everything
+# worked. An interrupt, or the abort described below, left them on the host -
+# and a leftover "_hg_probe_set" then stops a later attempt creating a set of
+# that name with different parameters, so the failure was sticky.
+hg_probe_cleanup() {
+    iptables  -F "$HG_PROBE"     2>/dev/null || true
+    iptables  -X "$HG_PROBE"     2>/dev/null || true
+    iptables  -t nat -F "$HG_NAT_PROBE" 2>/dev/null || true
+    iptables  -t nat -X "$HG_NAT_PROBE" 2>/dev/null || true
+    ip6tables -F "$HG6_PROBE"    2>/dev/null || true
+    ip6tables -X "$HG6_PROBE"    2>/dev/null || true
+    ipset destroy _hg_probe_set  2>/dev/null || true
+}
+trap hg_probe_cleanup EXIT
+
 iptables -F "$HG_PROBE" 2>/dev/null || true
 iptables -X "$HG_PROBE" 2>/dev/null || true
 
 if iptables -N "$HG_PROBE" 2>/dev/null; then
     probe() {
         # probe <label> <required|optional> <feature it serves> <rule arguments...>
+        #
+        # Always returns 0. A missing optional match is reported and counted
+        # where it matters - COMPAT_ERRORS for a required one - and is not
+        # signalled by an exit status, because "set -e" is in force at the top
+        # of this script and these calls are standalone commands rather than
+        # conditions.
+        #
+        # Returning 1 therefore terminated the installer. On any kernel without
+        # xt_limit, xt_recent, xt_connlimit, xt_comment, xt_set, the SET target
+        # or the LOG or REJECT targets - every one of which this function is
+        # about to describe as optional and warn about rather than fail on -
+        # the install printed a single "not available" line and exited, with no
+        # error, no summary, and nothing installed.
         local label="$1"; local required="$2"; local feature="$3"; shift 3
         if iptables -A "$HG_PROBE" "$@" 2>/dev/null; then
             iptables -D "$HG_PROBE" "$@" 2>/dev/null
@@ -328,7 +362,7 @@ if iptables -N "$HG_PROBE" 2>/dev/null; then
         else
             log_warn "  ${label}: not available - ${feature} will not work"
         fi
-        return 1
+        return 0
     }
 
     # Connection tracking. One of the two spellings must work, or the firewall
@@ -383,7 +417,8 @@ if iptables -N "$HG_PROBE" 2>/dev/null; then
     # The block notice redirect lives in the nat table, which is a separate
     # table from everything probed above and may be absent on a stripped
     # kernel.
-    HG_NAT_PROBE="_hg_nat_$$"
+    # HG_NAT_PROBE is set with the other probe names above, so the cleanup
+    # trap can remove it however this script exits.
     if iptables -t nat -N "$HG_NAT_PROBE" 2>/dev/null; then
         if iptables -t nat -A "$HG_NAT_PROBE" -p tcp --dport 80 \
                     -j REDIRECT --to-port 8899 2>/dev/null; then
@@ -408,7 +443,8 @@ if iptables -N "$HG_PROBE" 2>/dev/null; then
             # to on-link senders. Probed because without it the firewall has to
             # accept ND unrestricted - IPv6 does not work otherwise - and that
             # is a decision an operator should know was taken.
-            HG6_PROBE="_hg6_probe_$$"
+            # HG6_PROBE is set with the other probe names above, so the
+            # cleanup trap can remove it however this script exits.
             if ip6tables -N "$HG6_PROBE" 2>/dev/null; then
                 if ip6tables -A "$HG6_PROBE" -p icmpv6 --icmpv6-type 135                              -m hl --hl-eq 255 -j ACCEPT 2>/dev/null; then
                     ip6tables -D "$HG6_PROBE" -p icmpv6 --icmpv6-type 135                               -m hl --hl-eq 255 -j ACCEPT 2>/dev/null
@@ -788,13 +824,43 @@ log_info "Systemd services installed and enabled."
 
 log_step "Detecting server IP addresses..."
 
+# Whether a list file already carries an entry for an address.
+#
+# The guard was 'grep -q "^${ip}$"', which could never match, because the line
+# this script writes is the address followed by a comment. So every install and
+# every upgrade appended another copy of every server address and of the
+# administrator's address to both files. The ruleset was unaffected - ipset
+# adds use -exist - but allow.conf is the one file that decides who bypasses
+# every block, and it is the file an operator most needs to be able to read at
+# a glance. After a few upgrades it could not be read at a glance.
+#
+# The comparison is a string comparison, not a pattern match. Interpolated into
+# a regular expression, an IPv4 address is one in which every dot matches any
+# character - 10.0.0.1 matches 10x0y0z1 as readily as itself - and escaping it
+# reliably across the sed and grep variants this may run under is more
+# trouble than reading the file and comparing fields.
+hg_list_has() {
+    local file="$1"
+    local ip="$2"
+    local entry rest
+    [ -f "$file" ] || return 1
+    # The default IFS strips leading whitespace and splits on it, so $entry is
+    # the first field of the line however it is indented.
+    while read -r entry rest || [ -n "$entry" ]; do
+        entry="${entry%%#*}"                # a comment may abut the address
+        [ -n "$entry" ] || continue         # blank line, or a comment line
+        [ "$entry" = "$ip" ] && return 0
+    done < "$file"
+    return 1
+}
+
 SERVER_IPS=$(ip -4 addr show scope global 2>/dev/null | grep -oP 'inet \K[\d.]+' | sort -u)
 for sip in $SERVER_IPS; do
-    if ! grep -q "^${sip}$" /etc/hostguard/ignore.conf 2>/dev/null; then
+    if ! hg_list_has /etc/hostguard/ignore.conf "$sip"; then
         echo "$sip # Server IP (auto-detected)" >> /etc/hostguard/ignore.conf
         log_info "Added server IP to ignore list: $sip"
     fi
-    if ! grep -q "^${sip}$" /etc/hostguard/allow.conf 2>/dev/null; then
+    if ! hg_list_has /etc/hostguard/allow.conf "$sip"; then
         echo "$sip # Server IP (auto-detected)" >> /etc/hostguard/allow.conf
         log_info "Added server IP to allowlist: $sip"
     fi
@@ -823,11 +889,11 @@ if [ -z "$ADMIN_IP" ]; then
     log_warn "  hostguard -a <your.ip.here> 'admin'"
 fi
 if [ -n "$ADMIN_IP" ] && [ "$ADMIN_IP" != "" ]; then
-    if ! grep -q "^${ADMIN_IP}$" /etc/hostguard/allow.conf 2>/dev/null; then
+    if ! hg_list_has /etc/hostguard/allow.conf "$ADMIN_IP"; then
         echo "$ADMIN_IP # Admin IP (auto-detected at install)" >> /etc/hostguard/allow.conf
         log_info "Added admin SSH IP to allowlist: $ADMIN_IP"
     fi
-    if ! grep -q "^${ADMIN_IP}$" /etc/hostguard/ignore.conf 2>/dev/null; then
+    if ! hg_list_has /etc/hostguard/ignore.conf "$ADMIN_IP"; then
         echo "$ADMIN_IP # Admin IP (auto-detected at install)" >> /etc/hostguard/ignore.conf
     fi
 fi

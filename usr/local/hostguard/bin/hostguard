@@ -867,7 +867,12 @@ sub cmd_status {
     if (@blocklists) {
         print "\nBlock lists:\n";
         for my $entry (@blocklists) {
-            my ($v4, $v6) = HGBlocklist->cached_entries($entry->{name});
+            # $config passed, so the floor this counts against is the one
+            # the firewall loaded the sets with. Without it the status
+            # page judged by the built-in default and could report fewer
+            # entries than the kernel is actually matching on.
+            my ($v4, $v6) = HGBlocklist->cached_entries($entry->{name}, undef,
+                                                        $config);
             my $age = HGBlocklist->age($entry);
             printf("  %-24s %d entries%s\n",
                    $entry->{name},
@@ -884,7 +889,7 @@ sub cmd_status {
         print "\nCountry filtering (" . uc($geo_mode) . " mode):\n";
         for my $cc (@codes) {
             my $age = HGGeo->age($cc, 'inet');
-            printf("  %-6s %d ranges%s\n", $cc, HGGeo->count($cc),
+            printf("  %-6s %d ranges%s\n", $cc, HGGeo->count($cc, $config),
                    defined $age ? " (updated " . format_duration($age) . " ago)"
                                 : " (never downloaded)");
         }

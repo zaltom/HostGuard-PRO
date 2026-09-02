@@ -68,6 +68,34 @@ our $MAX_SHRINK_PERCENT = 60;
 # of allocations can legitimately halve.
 our $SHRINK_FLOOR = 100;
 
+# How much of a downloaded file has to parse as ranges before it is believed to
+# be a zone file, as a percentage of its content lines. Overridden by
+# GEO_MIN_VALID_PERCENT. The same test HGBlocklist applies, for the same reason
+# and with the same numbers.
+our $MIN_VALID_PERCENT = 50;
+
+# Below this many content lines there is not enough of a file to judge that
+# proportion on, and the check is skipped.
+our $MIN_SAMPLE_LINES = 20;
+
+# The fewest ranges a country zone file may hold and still be believed.
+#
+# The proportion test cannot catch a short response that happens to be all
+# addresses, and that is the shape of several error pages. Set low enough that
+# no real country is refused - the smallest national allocations run to dozens
+# of ranges - and overridable with "hostguard -c force".
+our $MIN_RANGES = 8;
+
+# The fewest ranges that may be in force before GEO_ALLOW is applied at all.
+#
+# Separate from MIN_RANGES because it guards a different moment: that one
+# decides whether a download is believable, this one decides whether what is on
+# disk is enough to build a chain that drops everything it does not match. A
+# cache file restored from a backup or left by an older release never went
+# through the download check; this is the last point before the rule is
+# emitted. See HGFirewall::_apply_geo_rules.
+our $ALLOW_MIN_RANGES = 8;
+
 sub cache_dir { return "$HGConfig::DATA_DIR/geo"; }
 
 sub cache_file {
@@ -154,13 +182,22 @@ sub is_due {
 # The cache holds one validated range per line, so counting lines is counting
 # ranges.
 sub cached_count {
-    my ($class, $cc, $family) = @_;
+    my ($class, $cc, $family, $config) = @_;
+
+    # Counts what would actually load, so the shrink comparison is like with
+    # like and the WHM page prints the number the firewall holds rather than
+    # the number of lines in the file. Silent: the condition it would report is
+    # already reported by cached_ranges, which is what loads the set.
+    $config = HGConfig::resolve_config($config);
 
     my $file = $class->cache_file($cc, $family);
     open(my $fh, '<', $file) or return undef;
     my $count = 0;
     while (my $line = <$fh>) {
-        $count++ if $line =~ /\S/;
+        chomp $line;
+        next unless $line =~ /\S/;
+        next if HGConfig::too_broad($line, $config);
+        $count++;
     }
     close($fh);
     return $count;
@@ -180,15 +217,80 @@ sub _percent {
 # Returns undef to accept it, or the reason to refuse. The shape follows
 # HGBlocklist::_reject_reason deliberately rather than being invented again:
 # the structural test has no override, and the heuristic one does.
+#
+# It followed only half of it. HGBlocklist asks two independent questions - how
+# much of the file parsed as addresses, and how far the count fell against the
+# copy being replaced - and this asked only the second. Worse, the second is
+# skipped entirely when there is no previous copy, which is exactly the state
+# of a first download. So a first "hostguard -c" against a publisher having an
+# outage accepted whatever came back, provided one address-shaped token
+# appeared anywhere in it.
+#
+# In GEO_ALLOW mode that is not a country filter that does nothing. The chain
+# returns for the ranges it holds and drops everything else, so a zone file of
+# one address makes the host reachable from one address. The log said
+# "updated: 1 ranges" and the firewall started cleanly.
 sub _reject_reason {
-    my ($class, $cc, $family, $ranges, $config, $force) = @_;
+    my ($class, $cc, $family, $ranges, $stats, $config, $force) = @_;
+    $stats ||= {};
+
+    # A range wider than the floor, before anything else, and with no override.
+    #
+    # Before the emptiness check, not after it, and the ordering is the whole
+    # point. _parse_with_stats drops a too-broad range rather than keeping it,
+    # so a zone file in which *every* range trips the floor comes back with an
+    # empty list and a positive count - and asking "is it empty" first answered
+    # "it contained no usable ranges", which sends the operator looking for a
+    # truncated download when what happened is that the prefix floor refused
+    # the lot. HGBlocklist::_reject_reason has always asked in this order.
+    if ($stats->{too_broad}) {
+        return "$stats->{too_broad} of its ranges reach further than "
+             . "MIN_PREFIX4/MIN_PREFIX6 allow"
+             . (defined $stats->{broad_eg} ? " (for example $stats->{broad_eg})"
+                                           : '')
+             . ", which is not what a country allocation looks like";
+    }
 
     return "it contained no usable ranges" unless @$ranges;
+
+    # Is this an address list at all?
+    #
+    # The structural question, asked the way HGBlocklist asks it and for the
+    # same reason. An HTML page, a JSON error body or a redirect notice is
+    # mostly lines that are not addresses; a zone file is almost entirely
+    # lines that are. No override: nothing that fails this is a zone file.
+    my $considered = $stats->{considered} || 0;
+    my $min = _percent($config, 'GEO_MIN_VALID_PERCENT', $MIN_VALID_PERCENT);
+    if ($min > 0 && $considered >= $MIN_SAMPLE_LINES) {
+        my $pct = int(100 * ($stats->{valid} || 0) / $considered);
+        return "only $pct% of its $considered content lines are ranges, below "
+             . "the $min% expected of a country zone file "
+             . "(GEO_MIN_VALID_PERCENT)"
+            if $pct < $min;
+    }
+
+    # An absolute floor, which is what the proportion test cannot supply.
+    #
+    # A short response that happens to be all addresses passes the percentage
+    # and is still not a country. No allocation this software is asked to
+    # allow or deny consists of a handful of ranges; the smallest real zone
+    # files run to dozens. Deliberately low, so a genuinely tiny country is not
+    # refused, and overridable by force for the operator who has one.
+    my $min_ranges = $config->{GEO_MIN_RANGES};
+    $min_ranges = $MIN_RANGES
+        unless defined $min_ranges && $min_ranges =~ /^\d+$/;
+    if (!$force && $min_ranges > 0 && scalar(@$ranges) < $min_ranges) {
+        return "it holds only " . scalar(@$ranges) . " range(s), below the "
+             . "$min_ranges a country zone file is expected to have "
+             . "(GEO_MIN_RANGES). A response this short is usually an error "
+             . "page rather than a zone file; run \"hostguard -c force\" if "
+             . "the country really is this small";
+    }
 
     my $shrink = _percent($config, 'GEO_MAX_SHRINK_PERCENT', $MAX_SHRINK_PERCENT);
     return undef if $force || $shrink <= 0 || $shrink >= 100;
 
-    my $previous = $class->cached_count($cc, $family);
+    my $previous = $class->cached_count($cc, $family, $config);
     return undef unless defined $previous && $previous >= $SHRINK_FLOOR;
 
     my $floor = int($previous * (100 - $shrink) / 100);
@@ -253,8 +355,10 @@ sub refresh {
         return 0;
     }
 
-    my @ranges = $class->_parse($tmp, $family);
-    if (my $why = $class->_reject_reason($cc, $family, \@ranges, $config, $opt{force})) {
+    my ($ranges, $stats) = $class->_parse_with_stats($tmp, $family, $config);
+    my @ranges = @$ranges;
+    if (my $why = $class->_reject_reason($cc, $family, \@ranges, $stats,
+                                         $config, $opt{force})) {
         unlink($tmp);
         HGLogger->error("Country zone $cc ($family) was not applied because "
                       . "$why; keeping the previous copy");
@@ -296,10 +400,32 @@ sub refresh_due {
 
 # Keep only lines that validate as a range of the expected family.
 sub _parse {
-    my ($class, $file, $family) = @_;
+    my ($class, $file, $family, $config) = @_;
+    my ($ranges) = $class->_parse_with_stats($file, $family, $config);
+    return @$ranges;
+}
+
+# The same parse, with a count of what was rejected along the way.
+#
+# The counts are the whole of what _reject_reason needs and did not have. This
+# module only ever asked "did anything parse", which HGBlocklist's own comment
+# explains at length is the wrong question: an error page, a login redirect or
+# a parked-domain notice can carry an address in its markup, and the answer is
+# yes.
+#
+#   considered  lines with content once comments and whitespace were removed
+#   valid       lines whose first token was a range of the expected family
+#   kept        ranges actually stored, so valid minus duplicates
+#   too_broad   ranges reaching further than MIN_PREFIX4/MIN_PREFIX6 allow
+#   broad_eg    one of those, to name in the message
+sub _parse_with_stats {
+    my ($class, $file, $family, $config) = @_;
 
     my @ranges;
-    open(my $fh, '<', $file) or return @ranges;
+    my %stats = (considered => 0, valid => 0, kept => 0,
+                 too_broad => 0, broad_eg => undef);
+
+    open(my $fh, '<', $file) or return (\@ranges, \%stats);
 
     my %seen;
     while (my $line = <$fh>) {
@@ -309,6 +435,8 @@ sub _parse {
         $line =~ s/\s+$//;
         next unless length $line;
 
+        $stats{considered}++;
+
         my ($token) = split(/\s+/, $line, 2);
         next unless defined $token && length $token;
 
@@ -317,28 +445,68 @@ sub _parse {
         } else {
             next unless HGConfig->valid_ipv4($token);
         }
+        $stats{valid}++;
+
+        # A zone file is a list of allocations, not a statement about the whole
+        # address space. In allow mode an over-wide range lets in everything it
+        # covers; in deny mode it drops everything it covers. See
+        # HGConfig::too_broad.
+        if (HGConfig::too_broad($token, $config)) {
+            $stats{too_broad}++;
+            $stats{broad_eg} //= $token;
+            next;
+        }
+
         next if $seen{$token}++;
 
         push @ranges, $token;
     }
     close($fh);
 
-    return @ranges;
+    $stats{kept} = scalar(@ranges);
+    return (\@ranges, \%stats);
 }
 
 # Read a cached country file.
+#
+# The prefix floor is applied here too, not only at download time. The cache is
+# written from ranges that already passed it, so on the ordinary path this
+# finds nothing - but a cache file restored from a backup, edited by hand, or
+# left by a release that had no floor never went through the download path, and
+# this is what the firewall loads its sets from.
 sub cached_ranges {
-    my ($class, $cc, $family) = @_;
+    my ($class, $cc, $family, $config) = @_;
+
+    # Resolved once, not once per range, and for the reason cached_entries
+    # gives: the floor has to be the one the firewall loads with.
+    $config = HGConfig::resolve_config($config);
 
     my @ranges;
+    my $too_broad = 0;
+    my $example;
+
     my $file = $class->cache_file($cc, $family);
     open(my $fh, '<', $file) or return @ranges;
     while (my $line = <$fh>) {
         chomp $line;
         next unless length $line;
+
+        if (HGConfig::too_broad($line, $config)) {
+            $too_broad++;
+            $example //= $line;
+            next;
+        }
+
         push @ranges, $line;
     }
     close($fh);
+
+    HGLogger->error("Country $cc ($family): $too_broad cached range(s) reach "
+                  . "further than MIN_PREFIX4/MIN_PREFIX6 allow"
+                  . (defined $example ? " (for example $example)" : '')
+                  . " and are NOT being loaded. Re-download with "
+                  . "'hostguard -c force'.")
+        if $too_broad;
 
     return @ranges;
 }
@@ -346,9 +514,12 @@ sub cached_ranges {
 # Total ranges held for a country, across both families. Used by the status
 # output and the WHM page.
 sub count {
-    my ($class, $cc) = @_;
-    return scalar($class->cached_ranges($cc, 'inet'))
-         + scalar($class->cached_ranges($cc, 'inet6'));
+    my ($class, $cc, $config) = @_;
+    # Resolved here so the two reads below share one, rather than loading the
+    # file twice.
+    $config = HGConfig::resolve_config($config);
+    return scalar($class->cached_ranges($cc, 'inet', $config))
+         + scalar($class->cached_ranges($cc, 'inet6', $config));
 }
 
 # Fetch a list to a file, bounded by BLOCKLIST_MAX_SIZE.

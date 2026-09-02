@@ -860,14 +860,14 @@ sub _setup_ipsets {
     for my $set ($SET_ALLOW4, $SET_DENY4, $SET_TEMP4, $SET_TALLOW4, $SET_BOGON4) {
         _run_quiet($IPSET, 'destroy', $set);
         _run($IPSET, 'create', $set, 'hash:net', 'family', 'inet',
-             'hashsize', '4096', 'maxelem', '1000000',
+             'hashsize', '4096', 'maxelem', $HGConfig::SET_MAXELEM,
              ($needs_timeout{$set} ? ('timeout', '0') : ()));
     }
     if ($IPV6) {
         for my $set ($SET_ALLOW6, $SET_DENY6, $SET_TEMP6, $SET_TALLOW6, $SET_BOGON6) {
             _run_quiet($IPSET, 'destroy', $set);
             _run($IPSET, 'create', $set, 'hash:net', 'family', 'inet6',
-                 'hashsize', '4096', 'maxelem', '1000000',
+                 'hashsize', '4096', 'maxelem', $HGConfig::SET_MAXELEM,
                  ($needs_timeout{$set} ? ('timeout', '0') : ()));
         }
     }
@@ -997,13 +997,13 @@ sub _setup_geo_sets {
         my $set = _geo_set($cc, 'inet');
         _run_quiet($IPSET, 'destroy', $set);
         _run($IPSET, 'create', $set, 'hash:net', 'family', 'inet',
-             'hashsize', '8192', 'maxelem', '1000000');
+             'hashsize', '8192', 'maxelem', $HGConfig::SET_MAXELEM);
 
         next unless $IPV6;
         my $set6 = _geo_set($cc, 'inet6');
         _run_quiet($IPSET, 'destroy', $set6);
         _run($IPSET, 'create', $set6, 'hash:net', 'family', 'inet6',
-             'hashsize', '4096', 'maxelem', '1000000');
+             'hashsize', '4096', 'maxelem', $HGConfig::SET_MAXELEM);
     }
 }
 
@@ -1025,14 +1025,14 @@ sub _load_geo {
     my $example;
 
     for my $cc (@codes) {
-        my @v4 = HGGeo->cached_ranges($cc, 'inet');
+        my @v4 = HGGeo->cached_ranges($cc, 'inet', $config);
         if (@v4 && !_ipset_fill(_geo_set($cc, 'inet'), \@v4)) {
             $failed++;
             $example //= "$cc (inet)";
         }
 
         if ($IPV6) {
-            my @v6 = HGGeo->cached_ranges($cc, 'inet6');
+            my @v6 = HGGeo->cached_ranges($cc, 'inet6', $config);
             if (@v6 && !_ipset_fill(_geo_set($cc, 'inet6'), \@v6)) {
                 $failed++;
                 $example //= "$cc (inet6)";
@@ -1072,13 +1072,26 @@ sub _apply_geo_rules {
 
     my $loaded = 0;
     for my $cc (@codes) {
-        $loaded += scalar(HGGeo->cached_ranges($cc, $family));
+        $loaded += scalar(HGGeo->cached_ranges($cc, $family, $config));
     }
 
-    if ($mode eq 'allow' && !$loaded) {
-        HGLogger->error("GEO_ALLOW is set but no $family ranges have been "
-                      . "downloaded; not applying it, because it would drop "
-                      . "all traffic. Run 'hostguard -c force' first.");
+    # An allow mode built on almost nothing, refused for the same reason an
+    # empty one is.
+    #
+    # This tested "$loaded is zero", which is a count and not a judgement. One
+    # range passed it, and one range in allow mode is a chain that returns for
+    # a single address and drops the rest of the internet - the host reachable
+    # from one place, reported as a country policy correctly applied. A zone
+    # file that short is an error page; a real country has dozens of ranges at
+    # the very least. HGGeo refuses such a download now, but a cache written
+    # before that check existed, or restored from a backup, reaches here
+    # without ever having been offered to it.
+    if ($mode eq 'allow' && $loaded < $HGGeo::ALLOW_MIN_RANGES) {
+        HGLogger->error("GEO_ALLOW is set but only $loaded $family range(s) "
+                      . "are cached, below the $HGGeo::ALLOW_MIN_RANGES needed "
+                      . "to believe them; not applying it, because it would "
+                      . "drop very nearly all traffic. Run "
+                      . "'hostguard -c force' first.");
 
         # Applying a country allowlist to one address family and not the other
         # is worse than applying it to neither. Each family is built by its own
@@ -1109,7 +1122,7 @@ sub _apply_geo_rules {
     if ($mode eq 'deny') {
         # One rule per country, sending its traffic to the drop chain.
         for my $cc (@codes) {
-            next unless HGGeo->cached_ranges($cc, $family);
+            next unless HGGeo->cached_ranges($cc, $family, $config);
             _run($cmd, '-A', $chain, '-m', 'set',
                  '--match-set', _geo_set($cc, $family), 'src', '-j', $drop);
         }
@@ -1128,7 +1141,7 @@ sub _apply_geo_rules {
     $GEO_ALLOW_APPLIED{$family} = 1;
 
     for my $cc (@codes) {
-        next unless HGGeo->cached_ranges($cc, $family);
+        next unless HGGeo->cached_ranges($cc, $family, $config);
         _run($cmd, '-A', $geo_chain, '-m', 'set',
              '--match-set', _geo_set($cc, $family), 'src', '-j', 'RETURN');
     }
@@ -1136,6 +1149,40 @@ sub _apply_geo_rules {
     _run($cmd, '-A', $chain, '-j', $geo_chain);
 
     return 0;
+}
+
+# Whether a set of this name belongs to the given slot.
+#
+# One decision, in one place, because there were two and they disagreed.
+# _destroy_blocklist_sets had it right and _destroy_geo_sets did not: the empty
+# slot means "the unsuffixed sets an older release left behind", and interpolated
+# into a pattern as an empty suffix it means "anything at all". So
+# "^hgc6?_.*$" matched every country set on the host, including the live slot's
+# - and start() calls _teardown_slot('') immediately after activating the new
+# slot.
+#
+# Nothing was lost in practice, because ipset refuses to destroy a set a rule
+# still refers to and _run_quiet swallows the refusal. That is kernel
+# refcounting doing this function's job for it, which is not the same as this
+# function doing it. Where it did bite: a configured country whose zone file
+# has not been downloaded yet gets a set from _setup_geo_sets but no rule from
+# _apply_geo_rules, so nothing refers to it, it is destroyed on every start,
+# and refresh_geo_set then finds no set to swap into and defers the country to
+# "the next reload" for as long as that lasts.
+#
+# $prefix is the anchored pattern for the family of sets being considered.
+sub _set_belongs_to_slot {
+    my ($name, $slot, $prefix) = @_;
+
+    return 0 unless defined $name && length $name;
+    return 0 unless $name =~ /$prefix/;
+
+    my $suffix = defined $slot ? lc($slot) : '';
+
+    # The unsuffixed sets only. A set belonging to a slot is left alone.
+    return ($name =~ /_[ab]$/) ? 0 : 1 if $suffix eq '';
+
+    return ($name =~ /\Q$suffix\E$/) ? 1 : 0;
 }
 
 # Destroy every country set belonging to a slot.
@@ -1146,13 +1193,11 @@ sub _destroy_geo_sets {
     my ($slot) = @_;
     return unless $IPSET;
 
-    my $suffix = lc($slot);
     my (undef, $out) = _exec($IPSET, 'list', '-n');
     for my $name (split(/\n/, ($out // ''))) {
         $name =~ s/^\s+//;
         $name =~ s/\s+$//;
-        next unless length $name;
-        next unless $name =~ /^hgc6?_.*\Q$suffix\E$/;
+        next unless _set_belongs_to_slot($name, $slot, qr/^hgc6?_/);
         _run_quiet($IPSET, 'destroy', $name);
     }
 }
@@ -1189,7 +1234,8 @@ sub _refresh_geo_set_locked {
         return 0;
     }
 
-    my @ranges = HGGeo->cached_ranges($cc, $family);
+    my $config = eval { HGConfig->loadconfig() };
+    my @ranges = HGGeo->cached_ranges($cc, $family, $config);
     return 0 unless @ranges;
 
     # Refuse a set that has collapsed against what the live one is holding.
@@ -1236,7 +1282,7 @@ sub _refresh_geo_set_locked {
     _run_quiet($IPSET, 'destroy', $tmp);
 
     my ($create_rc) = _run($IPSET, 'create', $tmp, 'hash:net', 'family', $family,
-                           'hashsize', '8192', 'maxelem', '1000000');
+                           'hashsize', '8192', 'maxelem', $HGConfig::SET_MAXELEM);
     if ($create_rc) {
         HGLogger->error("Country $cc ($family) was not refreshed: the staging "
                       . "set could not be created. The ranges already loaded "
@@ -1359,11 +1405,11 @@ sub _setup_blocklist_sets {
     for my $entry (_blocklists()) {
         _run($IPSET, 'create', _bl_set($entry->{name}, 'inet'),
              'hash:net', 'family', 'inet',
-             'hashsize', '4096', 'maxelem', '1000000');
+             'hashsize', '4096', 'maxelem', $HGConfig::SET_MAXELEM);
         if ($IPV6) {
             _run($IPSET, 'create', _bl_set($entry->{name}, 'inet6'),
                  'hash:net', 'family', 'inet6',
-                 'hashsize', '4096', 'maxelem', '1000000');
+                 'hashsize', '4096', 'maxelem', $HGConfig::SET_MAXELEM);
         }
     }
 }
@@ -1379,7 +1425,9 @@ sub _load_blocklists {
     return unless ($config->get('BLOCKLIST_ENABLE') // 1);
 
     for my $entry (_blocklists()) {
-        my ($v4, $v6) = HGBlocklist->cached_entries($entry->{name});
+        my %cstats;
+        my ($v4, $v6) = HGBlocklist->cached_entries($entry->{name}, \%cstats,
+                                                    $config);
 
         unless (@$v4 || @$v6) {
             HGLogger->log_warn("Blocklist $entry->{name} has no cached data yet; "
@@ -1440,7 +1488,8 @@ sub _refresh_blocklist_set_locked {
     my ($class, $name) = @_;
 
     my %stats;
-    my ($v4, $v6) = HGBlocklist->cached_entries($name, \%stats);
+    my $config = eval { HGConfig->loadconfig() };
+    my ($v4, $v6) = HGBlocklist->cached_entries($name, \%stats, $config);
 
     if ($stats{unreadable}) {
         HGLogger->error("Blocklist $name was not applied: its cached copy "
@@ -1487,7 +1536,7 @@ sub _refresh_blocklist_set_locked {
 
         _run_quiet($IPSET, 'destroy', $tmp);
         my ($rc) = _run($IPSET, 'create', $tmp, 'hash:net', 'family', $family,
-                        'hashsize', '4096', 'maxelem', '1000000');
+                        'hashsize', '4096', 'maxelem', $HGConfig::SET_MAXELEM);
         if ($rc) {
             $failed++;
             next;
@@ -1624,7 +1673,6 @@ sub _ipset_fill {
 sub _destroy_blocklist_sets {
     my ($slot) = @_;
     return unless $IPSET;
-    $slot = defined $slot ? lc($slot) : '';
 
     my ($rc, $out) = _run_quiet($IPSET, 'list', '-n');
     return if $rc || !defined $out;
@@ -1632,14 +1680,7 @@ sub _destroy_blocklist_sets {
     for my $set (split(/\n/, $out)) {
         $set =~ s/^\s+//;
         $set =~ s/\s+$//;
-        next unless $set =~ /^hgb6?_/;
-
-        if ($slot eq '') {
-            # Unsuffixed sets only; a set belonging to a slot is left alone.
-            next if $set =~ /_[ab]$/;
-        } else {
-            next unless $set =~ /\Q$slot\E$/;
-        }
+        next unless _set_belongs_to_slot($set, $slot, qr/^hgb6?_/);
         _run_quiet($IPSET, 'destroy', $set);
     }
 }
@@ -1743,6 +1784,17 @@ sub _remember_policy {
 }
 
 # Put back the policies HostGuard Pro changed, and only those.
+#
+# The record is removed when every policy in it has been put back, and not
+# before. Deleting it regardless is the same mistake as changing a policy
+# without recording it, arrived at from the other end: the value is gone and
+# nothing anywhere still knows what it was.
+#
+# The failure this guards against is ordinary, not exotic. "iptables -P" takes
+# the xtables lock, and a stop is exactly when other things on the host are
+# also reloading - dockerd publishing a container port, firewalld restarting.
+# One lost command left the FORWARD policy at HostGuard Pro's DROP for good,
+# on a host that forwards, by a firewall the administrator had just removed.
 sub _restore_policies {
     my %saved = _saved_policies();
 
@@ -1754,17 +1806,47 @@ sub _restore_policies {
         return;
     }
 
+    my @unrestored;
     for my $key (sort keys %saved) {
         my ($family, $chain) = split(/\|/, $key, 2);
         my $cmd = _policy_cmd($family);
-        next unless $cmd && -x $cmd;
+
+        # No binary for this family means the policy cannot be read or set, so
+        # it has not been put back and the record must survive to say so.
+        unless ($cmd && -x $cmd) {
+            push @unrestored, "$key (no usable "
+                            . ($family eq 'inet6' ? 'ip6tables' : 'iptables')
+                            . " binary)";
+            next;
+        }
 
         my ($rc) = _run($cmd, '-P', $chain, $saved{$key});
-        HGLogger->info("Default $chain policy restored to $saved{$key}")
-            unless $rc;
+        if ($rc) {
+            push @unrestored, "$key (the command was refused)";
+            next;
+        }
+        HGLogger->info("Default $chain policy restored to $saved{$key}");
+    }
+
+    if (@unrestored) {
+        HGLogger->error("Some default policies could NOT be put back, so "
+                      . _policy_file() . " is being kept rather than removed: "
+                      . join(', ', @unrestored) . ". Until they are restored "
+                      . "the host is running with policies HostGuard Pro set "
+                      . "and no longer manages. Set them by hand, or run "
+                      . "'hostguard -x' again once whatever held the iptables "
+                      . "lock has finished:");
+        for my $key (sort keys %saved) {
+            my ($family, $chain) = split(/\|/, $key, 2);
+            HGLogger->error("  "
+                          . ($family eq 'inet6' ? 'ip6tables' : 'iptables')
+                          . " -P $chain $saved{$key}");
+        }
+        return 0;
     }
 
     unlink(_policy_file());
+    return 1;
 }
 
 ###############################################################################
@@ -2064,6 +2146,26 @@ sub _build_rules {
              '-m', 'set', '--match-set', $SET_BOGON4, 'src', '-j', $CHAIN_LOGDROP);
     }
 
+    # Let a temporarily blocked address reach the notice responder.
+    #
+    # Without this the notice service cannot work at all, and did not. The
+    # redirect that sends a blocked visitor to the responder lives in the nat
+    # table, which runs before the filter table - so the packet arrives here
+    # with its destination rewritten to the responder's port and its source
+    # still in the temporary block set, and the very next rule drops it. The
+    # redirect selects on that set, so this was true of every packet the
+    # feature was meant to serve, by construction. The log said the redirect
+    # was active and blocked visitors got the same silence as before.
+    #
+    # Placed here rather than further up on purpose. Above the deny sets,
+    # because that is what it exists to get past; below the allowlist, because
+    # an allowlisted address is not being blocked and has no business being
+    # redirected anywhere. Scoped to the temporary block set, so this opens the
+    # responder's port to exactly the addresses the redirect can send to it and
+    # to nobody else: the port is not in TCP_IN, so anything else reaching it
+    # falls through to the drop at the end of the chain.
+    $class->_apply_notice_accept($config);
+
     # Denylist
     if ($USE_IPSET) {
         _run($IPTABLES, '-A', $CHAIN_IN, @iface,
@@ -2173,9 +2275,35 @@ sub _build_rules {
         _run($IPTABLES, '-A', $CHAIN_OUT, '-j', 'ACCEPT');
     }
 
-    # FORWARD policy. DROP suits a standalone server; a host that routes for
-    # containers, a VPN or a NAT gateway sets FORWARD_POLICY to ACCEPT so that
-    # forwarded traffic survives.
+    $class->_apply_forward_policy($config, 'inet');
+
+    # _activate_slot() attaches this chain to INPUT/OUTPUT once the ipsets are
+    # populated, so it never receives traffic with an empty allowlist.
+
+    HGLogger->info("IPv4 firewall rules applied.");
+}
+
+# Set the FORWARD policy for one address family from FORWARD_POLICY.
+#
+# Both families, from the one setting. It applied to IPv4 alone, which is the
+# kind of asymmetry this module refuses everywhere else - and it was the worst
+# place for it, because the setting is named for the chain rather than for the
+# family and neither hostguard.conf nor the guide said otherwise. An operator
+# on a dual-stack host that forwards - containers with IPv6, a VPN, a router -
+# read FORWARD_POLICY=DROP as "forwarding is off" and had IPv6 forwarding at
+# whatever the kernel default was, filtered by nothing built here.
+#
+# DROP suits a standalone server; a host that routes for anything else sets
+# ACCEPT so that forwarded traffic survives.
+sub _apply_forward_policy {
+    my ($class, $config, $family) = @_;
+
+    my $v6  = ($family eq 'inet6');
+    my $cmd = $v6 ? $IP6TABLES : $IPTABLES;
+    return unless $cmd && -x $cmd;
+
+    my $label = $v6 ? 'IPv6 FORWARD' : 'FORWARD';
+
     my $forward = uc($config->get('FORWARD_POLICY') // 'DROP');
     $forward = 'DROP' unless $forward eq 'ACCEPT' || $forward eq 'DROP';
 
@@ -2193,27 +2321,27 @@ sub _build_rules {
     #
     # A policy that is already what we want is left alone and needs no record:
     # nothing is being changed, so there is nothing to put back.
-    my $current = _read_policy('inet', 'FORWARD');
+    my $current = _read_policy($family, 'FORWARD');
     if (defined $current && $current eq $forward) {
-        HGLogger->debug("FORWARD policy is already $forward; left as it is.");
-    } elsif (_remember_policy('inet', 'FORWARD')) {
-        _run($IPTABLES, '-P', 'FORWARD', $forward);
-    } else {
-        # Counted as a build failure so start() refuses to activate, for the
-        # same reason it refuses when a rule fails: this ruleset is not the
-        # one that was asked for. Nothing has been changed, so the slot already
-        # in force carries on and the FORWARD policy is still the host's own.
-        my $msg = "FORWARD policy was NOT set to $forward: the policy in force"
-                . " could not be recorded, and changing it without a record"
-                . " would leave it changed for good.";
-        HGLogger->error($msg);
-        push @BUILD_FAILURES, { cmd => $msg, rc => -1, out => '' };
+        HGLogger->debug("$label policy is already $forward; left as it is.");
+        return;
     }
 
-    # _activate_slot() attaches this chain to INPUT/OUTPUT once the ipsets are
-    # populated, so it never receives traffic with an empty allowlist.
+    if (_remember_policy($family, 'FORWARD')) {
+        _run($cmd, '-P', 'FORWARD', $forward);
+        return;
+    }
 
-    HGLogger->info("IPv4 firewall rules applied.");
+    # Counted as a build failure so start() refuses to activate, for the
+    # same reason it refuses when a rule fails: this ruleset is not the
+    # one that was asked for. Nothing has been changed, so the slot already
+    # in force carries on and the FORWARD policy is still the host's own.
+    my $msg = "$label policy was NOT set to $forward: the policy in force"
+            . " could not be recorded, and changing it without a record"
+            . " would leave it changed for good.";
+    HGLogger->error($msg);
+    push @BUILD_FAILURES, { cmd => $msg, rc => -1, out => '' };
+    return;
 }
 
 ###############################################################################
@@ -2456,6 +2584,10 @@ sub _build_rules6 {
     } else {
         _run($IP6TABLES, '-A', $CHAIN6_OUT, '-j', 'ACCEPT');
     }
+
+    # The FORWARD policy, from the same setting the IPv4 side reads and
+    # recorded the same way, so a stop puts back what was here.
+    $class->_apply_forward_policy($config, 'inet6');
 
     # _activate_slot() attaches these chains once the ipsets are populated.
 
@@ -3357,6 +3489,27 @@ sub _apply_unused_ips {
 # only to addresses in the temporary block set: a permanently denied address
 # stays dropped, because a permanent block is a decision that does not want
 # a conversation.
+# Accept traffic from a temporarily blocked address to the notice port.
+#
+# The counterpart to the nat redirect, in the filter table where the packet
+# actually gets decided. See the call site in _build_rules for why it sits
+# where it does.
+sub _apply_notice_accept {
+    my ($class, $config) = @_;
+
+    my %flat = $config->config();
+    return unless HGNotice->enabled(\%flat);
+    return unless $USE_IPSET;
+    return unless HGNotice->redirect_ports(\%flat);
+
+    my $to = HGNotice->port(\%flat);
+    return unless _valid_single_port($to);
+
+    _run($IPTABLES, '-A', $CHAIN_IN, '-p', 'tcp', '--dport', $to,
+         '-m', 'set', '--match-set', $SET_TEMP4, 'src', '-j', 'ACCEPT');
+    return;
+}
+
 sub _apply_notice_redirect {
     my ($class, $config) = @_;
 
@@ -3368,6 +3521,27 @@ sub _apply_notice_redirect {
     return unless @ports;
 
     my $to = HGNotice->port(\%flat);
+
+    # A responder on the loopback address cannot be reached by this redirect.
+    #
+    # REDIRECT rewrites the destination to the primary address of the incoming
+    # interface; only a locally generated packet is sent to 127.0.0.1. So with
+    # NOTICE_BIND at loopback the packet arrives at eth0:NOTICE_PORT, where
+    # nothing is listening, and the visitor gets a refused connection instead
+    # of the page. The default is no longer loopback, but an existing
+    # hostguard.conf still says what it said, so this is checked rather than
+    # assumed.
+    my $bind = $flat{NOTICE_BIND} || '';
+    if ($bind =~ /^127\./) {
+        HGLogger->error("NOTICE_BIND is $bind, but the redirect sends traffic "
+                      . "to this host's interface address rather than to "
+                      . "loopback, so nothing will be listening where the "
+                      . "packets arrive and blocked visitors will see a "
+                      . "refused connection. Set NOTICE_BIND to 0.0.0.0 or to "
+                      . "the address the site is served on. Not installing the "
+                      . "redirect.");
+        return;
+    }
 
     # Clear any rule left by an earlier run before adding this one, since nat
     # rules are not part of the slot that gets torn down.
@@ -3616,6 +3790,9 @@ sub _tempblock_locked {
 
     HGLogger->info("Temporary block: $ip for ${duration}s - $reason");
 
+    # Drop the connections the address already has, if asked to.
+    _flush_conntrack($ip, $config);
+
     # Call block report hook if configured
     my $hook = HGFirewall->safe_hook($config->get('BLOCK_REPORT'), 'BLOCK_REPORT');
     if ($hook) {
@@ -3715,7 +3892,79 @@ sub _permblock_locked {
     }
 
     HGLogger->info("Permanent block: $ip - $reason");
+
+    my $config = eval { HGConfig->loadconfig() };
+    _flush_conntrack($ip, $config);
+
     return 1;
+}
+
+###############################################################################
+# Existing connections
+###############################################################################
+
+# Drop the connection tracking entries an address already holds.
+#
+# A block stops new connections and nothing else. The ESTABLISHED,RELATED
+# accept has to sit above every deny path - a firewall that reconsidered every
+# packet of every conversation would cut legitimate long-lived connections on
+# every rule change - so an attacker who is mid-session when the block lands
+# keeps that session: an open SSH login, an upload in flight, a long-poll HTTP
+# connection, an exfiltration channel. "hostguard -l" shows the address as
+# held, and it is, for everything except the connection that mattered.
+#
+# CSF and everything else in this category behave the same way, so this is off
+# by default rather than presented as a fix for a defect. What it is for is the
+# host where a block is a response to something happening now.
+#
+# Needs conntrack-tools, which is not installed everywhere and is not a
+# dependency. A host without it is told once, when the setting is on and the
+# binary is missing, rather than on every block.
+my $CONNTRACK_WARNED = 0;
+
+sub _flush_conntrack {
+    my ($ip, $config) = @_;
+
+    return 0 unless $config;
+    return 0 unless ($config->get('BLOCK_FLUSH_CONNTRACK') // '0') eq '1';
+    return 0 unless defined $ip && HGConfig->valid_ip($ip);
+
+    # A range cannot be handed to "conntrack -D -s" as one argument, and
+    # expanding it here would mean deleting entries one address at a time
+    # across a network. Blocks placed by the daemon are always single
+    # addresses; a CIDR entry comes from deny.conf, where the next reload
+    # applies it anyway.
+    if ($ip =~ m{/}) {
+        HGLogger->debug("Not flushing conntrack for the range $ip");
+        return 0;
+    }
+
+    my $conntrack = HGConfig::find_bin('conntrack');
+    unless ($conntrack) {
+        unless ($CONNTRACK_WARNED++) {
+            HGLogger->log_warn("BLOCK_FLUSH_CONNTRACK is 1 but the conntrack "
+                             . "binary was not found, so connections a blocked "
+                             . "address already has are left running. Install "
+                             . "conntrack-tools, or set it back to 0.");
+        }
+        return 0;
+    }
+
+    # Both directions: an outbound connection this host opened to the address
+    # is as much a live channel as one it accepted.
+    my $removed = 0;
+    for my $dir ('-s', '-d') {
+        my ($rc, $out) = _run_quiet($conntrack, '-D', $dir, $ip);
+        # conntrack exits non-zero when it matched nothing, which is the
+        # ordinary case and not a failure.
+        next if $rc;
+        $removed += ($out =~ tr/\n//);
+    }
+
+    HGLogger->info("Dropped $removed existing connection(s) for $ip")
+        if $removed;
+
+    return $removed;
 }
 
 # Allow an IP (add to allow list)

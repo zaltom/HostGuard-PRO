@@ -699,12 +699,50 @@ provider outage cannot empty a list.
 
 ### What a download has to satisfy to be applied
 
-Three things, in order. It has to yield at least one usable address; at least
+Five things, in order. No entry may reach further than `MIN_PREFIX4` or
+`MIN_PREFIX6` allow; it must hold no more entries than an ipset here can carry;
+it has to yield at least one usable address; at least
 `BLOCKLIST_MIN_VALID_PERCENT` of its content lines have to be addresses; and it
 must not have fallen more than `BLOCKLIST_MAX_SHRINK_PERCENT` below the copy it
 replaces.
 
-Only the first of these used to be checked, and on its own it asks the wrong
+#### How wide a range may be
+
+`MIN_PREFIX4` and `MIN_PREFIX6` are the first test because they cover the
+sharpest failure. The only check an entry used to face was that it parsed as an
+address, and `0.0.0.0/0` parses. One such line in a list that is otherwise
+complete and correct passes every other test on this page - the file is still
+overwhelmingly addresses, and the entry count has not fallen - and the daemon
+swaps it into the live ipset without a firewall reload. The rule that set feeds
+sends every matching source to the drop chain, so every site on the host goes
+off the air and only an allowlisted address can still reach it.
+
+The defaults refuse anything wider than a `/8` for IPv4 or a `/32` for IPv6.
+A download containing one is refused whole and the previous copy kept, and
+there is deliberately **no force override**: unlike the shrink test, this is
+not a heuristic about a provider having a bad day. Raise the setting if a range
+that wide really is meant to be blocked.
+
+The same floor applies to country zone files, and to the cached copies of both
+on the way into the firewall - a cache restored from a backup or written by an
+older release never went through the download check, and the cache is what the
+sets are actually loaded from.
+
+#### How many entries there may be
+
+The ipsets these lists load into are created to hold a million entries. A
+cached list longer than that makes `ipset restore` abort, which makes the slot
+incomplete, which makes the firewall refuse to activate it. Failing closed is
+right - but the oversized copy is already on disk by then, so **every later
+reload fails the same way**, including the one run to fix a lockout or apply an
+emergency block. So a download past the ceiling is refused at download time and
+the previous copy kept. Set a `MAX` for a very large source in
+`blocklists.conf`; the shipped examples carry one.
+
+#### Is it a list at all?
+
+The remaining three used to be one - "does it contain an address" - and on its
+own that asks the wrong
 question. It asks whether the download contains an address, when what matters is
 whether the download is a block list. The two ways this goes wrong in practice
 both pass it: a provider serving an error page, a status page or a lapsed-account
@@ -1115,6 +1153,35 @@ already held is not counted again, so a block does not keep renewing itself.
 
 Blocks expire on their own, exactly as login-failure blocks do.
 
+## What a Block Does Not Do
+
+A block stops **new** connections. It does not close the ones the address
+already has.
+
+That is a consequence of rule order rather than an oversight. The
+`ESTABLISHED,RELATED` accept has to sit above every deny path: a firewall that
+reconsidered every packet of every conversation would cut legitimate
+long-lived connections on every rule change and every reload. So an attacker
+who is mid-session when the block lands keeps that session - an open SSH login,
+an upload in flight, a long-poll HTTP connection, an exfiltration channel.
+`hostguard -l` lists the address as held, and it is, for everything except the
+connection that mattered.
+
+CSF and every comparable product behave the same way. Where that is not good
+enough - where a block is a response to something happening right now - set:
+
+```
+BLOCK_FLUSH_CONNTRACK = "1"
+```
+
+Every temporary and permanent block then also removes the address's connection
+tracking entries, in both directions, so the existing connections die with it.
+This needs the `conntrack` binary from `conntrack-tools`, which is not a
+dependency of this package; without it the setting reports itself once in the
+log and does nothing. It is off by default because dropping established
+connections is a decision with its own consequences, and it should be one
+somebody made.
+
 ### Reporting
 
 The block is applied by the kernel, so the daemon does not see it happen. What
@@ -1186,10 +1253,34 @@ hostguard -r
 
 **On `GEO_ALLOW`.** It is a very sharp instrument. It drops everything the zone
 files do not account for, which includes addresses reassigned since the files
-were published and every address the publisher does not cover. Two safeguards
-apply: your allowlist still wins, so allowlist your own address before enabling
-it; and HostGuard Pro refuses to apply allow mode when the zone files are
-empty, rather than dropping all traffic on the strength of a failed download.
+were published and every address the publisher does not cover.
+
+The safeguards, all of which matter more here than in deny mode:
+
+- Your allowlist still wins. Allowlist your own address before enabling it.
+- A zone file must look like a zone file. At least `GEO_MIN_VALID_PERCENT` of
+  its content lines have to be ranges, and it must hold at least
+  `GEO_MIN_RANGES` of them.
+- No range may be wider than `MIN_PREFIX4` / `MIN_PREFIX6` allow.
+- It must not have collapsed against the copy it replaces
+  (`GEO_MAX_SHRINK_PERCENT`).
+- Allow mode is not applied at all unless there are enough ranges cached to
+  believe them.
+
+The first two of those were missing, and the gap was specific: the shrink test
+only compares against a previous copy, so on a **first** download - which is
+when you are least able to tell a good file from a bad one - nothing was
+checked beyond "not empty". A publisher serving an error page, a login redirect
+or a parked-domain notice can carry an address somewhere in its markup, and in
+allow mode a zone file of one address makes the host reachable from one
+address. It was reported as `Country zone GB (inet) updated: 1 ranges`,
+followed by a clean firewall start.
+
+The default publisher is a free, unauthenticated third party and is the single
+source for this data. Treat it accordingly.
+
+A genuinely tiny country that trips `GEO_MIN_RANGES` is accepted with
+`hostguard -c force`. Nothing overrides the prefix floor.
 
 Setting both `GEO_DENY` and `GEO_ALLOW` is a contradiction rather than a
 combination. `GEO_DENY` wins and the conflict is logged.
@@ -1222,6 +1313,50 @@ Things worth knowing:
 - The responder never reads a path, parameter or header from the request. It
   answers every request on its port with the same page.
 - The redirect lives in the nat table and is removed when the firewall stops.
+
+### Why `NOTICE_BIND` is not loopback
+
+It looks as though the responder should bind `127.0.0.1`: the redirect happens
+inside the host's own nat table, so nothing external needs to reach it. That
+reasoning is wrong about what `REDIRECT` does. It rewrites the destination to
+the **primary address of the incoming interface**; only a locally generated
+packet goes to `127.0.0.1`. A responder on loopback therefore never received a
+single redirected connection, and the feature answered nobody while the log
+said the redirect was active.
+
+`NOTICE_BIND` now defaults to `0.0.0.0`, and that does not publish the service.
+`NOTICE_PORT` is not in `TCP_IN`, and the only rule admitting traffic to it
+matches sources in the temporary block set - so the addresses that can reach
+the responder are exactly the addresses the redirect can send to it. Anything
+else falls through to the drop at the end of the input chain. The confinement
+is in the ruleset, where it can be read, rather than in the bind.
+
+That filter rule is the second half of the fix and was missing too. The
+redirected packet still traverses the input chain, where it met the temporary
+block drop - and the redirect selects on that very set, so every packet the
+feature existed to serve was dropped by construction. The accept sits above the
+deny sets, because that is what it is for, and below the allowlist, because an
+allowlisted address is not being blocked and has no business being redirected.
+
+Set `NOTICE_BIND` to a single public address instead if this host serves
+several and only one should answer.
+
+### The responder follows the firewall
+
+The confinement above is a property of the ruleset, not of the bind - so it
+lasts exactly as long as there is a ruleset. `hostguardd` is a separate unit
+from `hostguard`, and `Wants=` orders the two without tying their lifetimes, so
+`hostguard -x` stops the firewall and leaves the daemon running. The responder
+would then be bound to every interface with nothing in front of it.
+
+So the socket is opened only while a ruleset is in force and closed again
+within one parse interval - three seconds by default - of the firewall
+stopping, then reopened by itself when it starts again. The same check covers
+the case the unit ordering does not guarantee: a daemon that started before, or
+without, a firewall that failed to come up.
+
+A bind that fails - the port taken by something else - is reported once and
+retried a minute later rather than on every pass.
 
 ## Outbound Mail Tracking
 
@@ -1352,6 +1487,21 @@ means every account on the machine can do that. Carrying on with a warning
 would leave the warning as the only protection, and a log line repeated every
 minute is not protection. `ssh` refuses a private key with loose permissions
 for the same reason.
+
+**"Refused" means refused on both paths.** A refused key is an empty key
+internally, and an empty key is a usable HMAC key - so a receiver that did not
+check would happily authenticate a message signed under it, and anyone who
+could reach the port from a member address and knew the key had been refused
+could sign whatever they liked. The sending path always checked; the receiving
+path now does too, and refuses to parse a message at all without a usable key.
+
+The key is also re-examined every minute rather than only when the listeners
+open. The daemon holds its sockets for weeks, so a key whose mode or ownership
+degrades in that time - a restored backup, a configuration-management run, a
+key copied between members under a permissive umask - would otherwise leave the
+port answering until the next reload. When that happens the listeners are
+closed and the log says so; fix the key and run
+`systemctl reload hostguardd` to bring the cluster back.
 
 `hostguard --cluster list` names the exact problem and the command that fixes
 it:
@@ -1813,10 +1963,24 @@ default policies** - those chains' policies belong to whoever set them, which on
 a host also running CSF, firewalld, ufw, shorewall or a hand-written policy is
 not HostGuard Pro.
 
-The one policy it does set is IPv4 `FORWARD`, from `FORWARD_POLICY`. Before
-changing it, the previous value is recorded in
-`/var/lib/hostguard/saved_policies`, and `hostguard --stop` puts that value
-back. A policy with no record is left exactly as it is.
+The one policy it does set is `FORWARD`, from `FORWARD_POLICY` - for both
+address families when `IPV6=1`. Before changing either, the previous value is
+recorded in `/var/lib/hostguard/saved_policies`, and `hostguard --stop` puts
+that value back. A policy with no record is left exactly as it is.
+
+`FORWARD_POLICY` used to apply to IPv4 alone, which was worth knowing and was
+not written down anywhere an operator would look. On a dual-stack host that
+forwards - containers with IPv6, a VPN, a router - `FORWARD_POLICY=DROP` read
+as "forwarding is off" and IPv6 forwarding stayed at whatever the kernel
+default was, filtered by nothing HostGuard Pro built.
+
+If a policy cannot be put back - `iptables -P` takes the xtables lock, and a
+stop is exactly when other things on the host are also reloading -
+`saved_policies` is **kept**, not deleted, and the log names the chain and the
+command to run by hand. Deleting a record whose value had not been restored
+would have left the policy changed for good with nothing anywhere still knowing
+what it had been, which is the one thing this whole mechanism exists to
+prevent.
 
 That matters most on a host running Docker, which owns `FORWARD` and relies on
 it to keep its networks isolated. Setting it to `ACCEPT` on the way out - which
@@ -1853,8 +2017,16 @@ The uninstaller will:
    *Running Alongside Another Firewall* above)
 2. Remove systemd services
 3. Remove the WHM plugin
-4. Back up configuration to `/root/hostguard_backup/`
+4. Back up configuration **and the daemon log** to `/root/hostguard_backup/`
 5. Remove all installed files
+
+The log is backed up because it is the only record of what this firewall
+blocked and why, of every policy change made through WHM - the CGI writes those
+there with the account and the source address - and of every integrity,
+account-change and process finding. It used to be deleted and not copied, so an
+uninstall destroyed the audit trail as a side effect of tidying up, and anyone
+who reached root could destroy it with one supported command that looks like
+housekeeping.
 
 ## File Reference
 

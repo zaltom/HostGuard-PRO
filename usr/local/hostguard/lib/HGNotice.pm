@@ -222,20 +222,42 @@ sub _escape {
 
 # Open the responder's listening socket.
 #
-# Bound to the loopback address by default. The redirect happens inside the
-# host's own nat table, so the responder never needs to be reachable from
-# outside, and binding it to every interface would publish a service that has
-# no reason to be public.
+# Bound to every interface, which is not what it looks like.
+#
+# The obvious choice is loopback, on the reasoning that the redirect happens
+# inside the host's own nat table so the responder never needs to be reachable
+# from outside. That reasoning is wrong about what REDIRECT does: it rewrites
+# the destination to the primary address of the incoming interface, and only a
+# locally generated packet is sent to 127.0.0.1. A responder on loopback
+# therefore never received a single redirected packet, and the feature could
+# not work at all.
+#
+# Binding to every interface does not publish the service, because the port is
+# not opened by the firewall. NOTICE_PORT is absent from TCP_IN, and the only
+# rule that admits traffic to it is scoped to the temporary block set - so the
+# addresses that can reach the responder are exactly the addresses the redirect
+# can send to it. Anything else falls through to the drop at the end of the
+# input chain. The confinement is in the ruleset rather than in the bind, which
+# is where it can actually be stated.
 sub listener {
     my ($class, $config) = @_;
 
     return undef unless $class->enabled($config);
 
     my $port = $class->port($config);
-    my $bind = $config->{NOTICE_BIND} || '127.0.0.1';
+    my $bind = $config->{NOTICE_BIND} || '0.0.0.0';
     unless (HGConfig->valid_ipv4($bind)) {
         HGLogger->error("NOTICE_BIND is not an IPv4 address: $bind");
         return undef;
+    }
+
+    if ($bind =~ /^127\./) {
+        HGLogger->log_warn("NOTICE_BIND is $bind. The redirect sends blocked "
+                         . "visitors to this host's interface address, not to "
+                         . "loopback, so this responder will never be reached "
+                         . "and blocked visitors will see a refused connection "
+                         . "rather than the notice page. Set NOTICE_BIND to "
+                         . "0.0.0.0, or to the address the site is served on.");
     }
 
     my $sock;
@@ -269,6 +291,26 @@ sub listener {
 # and a per-process timer is the wrong tool for saying so.
 sub serve {
     my ($class, $listen, $config) = @_;
+
+    # A peer that goes away mid-write must not take the daemon with it.
+    #
+    # syswrite to a socket the other end has closed delivers SIGPIPE as well as
+    # returning EPIPE, and SIGPIPE's default action terminates the process.
+    # Perl installs no handler, and hostguardd sets TERM, INT, HUP, USR1 and
+    # CHLD but not PIPE - so without this line a client that sends a request
+    # and then resets the connection kills the firewall's daemon.
+    #
+    # Every peer reaching this socket is an address the firewall has already
+    # blocked, because that is what the nat redirect selects for. So the
+    # population that can trigger it and the population attacking the host are
+    # the same set, and closing a connection early is not something they have
+    # to be clever to do. A blocked attacker could switch off the thing that
+    # blocked them, on demand, in a loop.
+    #
+    # HGCluster::_send_all and HGAlert::_deliver take the same precaution on
+    # the same grounds; this is the third socket write in the codebase and was
+    # the one without it.
+    local $SIG{PIPE} = 'IGNORE';
 
     my $peer_addr = accept(my $conn, $listen);
     return 0 unless $peer_addr;

@@ -21,9 +21,16 @@ package HGAlert;
 ###############################################################################
 use strict;
 use warnings;
-use Fcntl qw(:DEFAULT :flock);
+use Fcntl qw(:DEFAULT :flock F_GETFL F_SETFL O_NONBLOCK);
+use Errno qw(EWOULDBLOCK EAGAIN EINTR);
+use POSIX ();
 use HGConfig;
 use HGLogger;
+
+# Longest one delivery may take, in seconds, from fork to the mailer being
+# collected. See _deliver.
+our $DELIVER_TIMEOUT = 5;
+our $DELIVER_GRACE   = 3;
 
 # Every notice kind: the configuration key that enables it, the subject line
 # used when no explicit subject is given, and the template that renders it.
@@ -532,12 +539,45 @@ sub reset_state {
 # Delivery
 ###############################################################################
 
+# Sub-second timing where it is available, so a five second deadline is a
+# deadline rather than a rounding error.
+sub _now {
+    return eval { require Time::HiRes; Time::HiRes::time() } || time();
+}
+
+sub _set_nonblocking {
+    my ($fh) = @_;
+    my $flags = fcntl($fh, F_GETFL, 0);
+    return 0 unless defined $flags;
+    return fcntl($fh, F_SETFL, $flags | O_NONBLOCK) ? 1 : 0;
+}
+
 # Hand a finished message to sendmail.
 #
 # The message is piped rather than passed on a command line, so a subject
 # built from a log line cannot become an argument. Only the recipient and
 # sender come from configuration, and both are checked for the header
 # injection that a newline would allow.
+#
+# Every step is bounded by a wall-clock deadline, which is the part that was
+# missing. This was "open(my $mail, '|-')" followed by a bare close(), and
+# close() on a piped handle waits for the child with no bound at all. A mailer
+# that hangs - a full spool, an NFS queue that has gone away, a sendmail
+# blocked on DNS - stopped the daemon indefinitely: no log read, so no new
+# attack from any source noticed; no block expiry; no slot verification; no
+# scheduled task. systemd went on reporting the unit active, because it was.
+#
+# LF_EMAIL_ALERT defaults to 1 and block_ip calls this on every new block, so
+# one hang was enough. The hourly ceiling does not help with that.
+#
+# Setting SIGCHLD to IGNORE, as the daemon does, does not shorten the wait
+# either: waitpid then blocks until every child has gone and returns -1.
+#
+# An explicit pipe and fork rather than open('|-'), for the reason
+# HGConfig::download_capped gives: closing a handle opened that way also waits
+# for the child, so the close and the reap have to be separate acts before the
+# reap can escalate. _reap_child is that escalation, and it is the same one
+# the downloader uses.
 sub _deliver {
     my ($config, $subject, $body, $kind) = @_;
 
@@ -560,27 +600,147 @@ sub _deliver {
         return 0;
     }
 
-    my $pid = open(my $mail, '|-');
+    my $message = "From: $from\n"
+                . "To: $to\n"
+                . "Subject: HostGuard Pro [$host] $subject\n"
+                . "Content-Type: text/plain; charset=UTF-8\n"
+                . "Auto-Submitted: auto-generated\n"
+                . "\n"
+                . $body;
+    $message .= "\n" unless $message =~ /\n\z/;
+
+    my ($rd, $wr);
+    unless (pipe($rd, $wr)) {
+        HGLogger->log_warn("Cannot create a pipe to send $kind notice: $!");
+        return 0;
+    }
+
+    # A mailer that exits early would otherwise deliver SIGPIPE, whose default
+    # action is to kill the daemon. A failed write is an undelivered notice.
+    local $SIG{PIPE} = 'IGNORE';
+
+    # Reaping needs a status to collect, and the daemon has asked the kernel to
+    # discard exactly that by setting SIGCHLD to IGNORE. Restored for the
+    # length of this call, and only this call.
+    local $SIG{CHLD} = 'DEFAULT';
+
+    my $pid = fork();
     unless (defined $pid) {
+        close($rd);
+        close($wr);
         HGLogger->log_warn("Cannot fork to send $kind notice: $!");
         return 0;
     }
     if ($pid == 0) {
+        close($wr);
+        open(STDIN, '<&', $rd);
+        close($rd);
         open(STDOUT, '>', '/dev/null');
         open(STDERR, '>', '/dev/null');
-        exec { $sendmail } $sendmail, '-t', '-oi';
-        exit(127);
+        # _exit rather than exit: this process shares the parent's buffers,
+        # and running the parent's exit handlers here would flush them.
+        exec { $sendmail } $sendmail, '-t', '-oi' or POSIX::_exit(127);
     }
 
-    print $mail "From: $from\n";
-    print $mail "To: $to\n";
-    print $mail "Subject: HostGuard Pro [$host] $subject\n";
-    print $mail "Content-Type: text/plain; charset=UTF-8\n";
-    print $mail "Auto-Submitted: auto-generated\n";
-    print $mail "\n";
-    print $mail $body;
-    print $mail "\n" unless $body =~ /\n\z/;
-    close($mail);
+    # The parent's copy of the read end has to go, or a mailer that exits never
+    # sees end of file on its stdin.
+    close($rd);
+
+    my $sent     = 0;
+    my $deadline = _now() + $DELIVER_TIMEOUT;
+    my $stalled  = 0;
+
+    if (_set_nonblocking($wr)) {
+        while ($sent < length($message)) {
+            my $left = $deadline - _now();
+            if ($left <= 0) { $stalled = 1; last }
+
+            my $vec = '';
+            vec($vec, fileno($wr), 1) = 1;
+            my $ready = select(undef, my $w = $vec, undef, $left);
+            unless (defined $ready && $ready > 0) {
+                next if !defined $ready && $! == EINTR;
+                $stalled = 1;
+                last;
+            }
+
+            my $n = syswrite($wr, $message, length($message) - $sent, $sent);
+            unless (defined $n) {
+                next if $! == EWOULDBLOCK || $! == EAGAIN || $! == EINTR;
+                HGLogger->log_warn("Cannot write the $kind notice to "
+                                 . "$sendmail: $!");
+                last;
+            }
+            last if $n == 0;
+            $sent += $n;
+        }
+    } else {
+        # Without a non-blocking descriptor there is no way to bound the write,
+        # and an unbounded one is what this exists to remove. A blocking write
+        # of a message this size will almost always complete inside the pipe
+        # buffer, so it is attempted once and the deadline is enforced by the
+        # reap below rather than abandoned altogether.
+        HGLogger->debug("Cannot set the pipe to $sendmail non-blocking; "
+                      . "writing the $kind notice without a write deadline");
+        $sent = (print $wr $message) ? length($message) : 0;
+    }
+
+    # Closing the write end is what tells sendmail the message is complete, so
+    # it happens before the wait rather than after it.
+    close($wr);
+
+    # A message we could not finish writing is a truncated mail, so the mailer
+    # is stopped rather than waited for.
+    my ($reaped, $status) =
+        HGConfig::_reap_child($pid, $stalled ? 0 : $DELIVER_GRACE);
+
+    if ($stalled) {
+        HGLogger->log_warn("The $kind notice was abandoned after "
+                         . "${DELIVER_TIMEOUT}s: $sendmail accepted $sent of "
+                         . length($message) . " bytes and then stopped reading. "
+                         . "The mail was not sent. Check the mail queue - a "
+                         . "mailer that blocks here would otherwise stop this "
+                         . "daemon reading logs.");
+        return 0;
+    }
+    unless ($reaped) {
+        HGLogger->log_warn("The $kind notice was handed to $sendmail, but it "
+                         . "could not be stopped or collected. The mail may or "
+                         . "may not have been sent.");
+        return 0;
+    }
+    # A wait status carries two different things and they need asking about
+    # separately.
+    #
+    # The exit code is in bits 8-15 and the signal that killed the child, if
+    # one did, is in the low seven. Testing only ">> 8" therefore reads a child
+    # killed by a signal as a clean exit: SIGTERM leaves $? as 15, and 15 >> 8
+    # is 0. That is exactly the child _reap_child produces when it escalates,
+    # which is the case this whole rework exists to handle - so the one path
+    # where the mailer had to be killed was the one reported as "Notice sent".
+    if (defined $status && $status > 0) {
+        if (my $signal = $status & 0x7f) {
+            HGLogger->log_warn("$sendmail did not finish within "
+                             . "${DELIVER_GRACE}s and was stopped (signal "
+                             . "$signal); the $kind notice was probably not "
+                             . "delivered.");
+            return 0;
+        }
+        if (my $exit = $status >> 8) {
+            HGLogger->log_warn("$sendmail exited with $exit; the $kind notice "
+                             . "was probably not delivered.");
+            return 0;
+        }
+    }
+
+    # -1 means the child was collected by something else and no status was
+    # available. The message was written and the pipe closed, so this is not a
+    # failure - but it is not a confirmed delivery either, and saying so in the
+    # log costs nothing.
+    if (defined $status && $status < 0) {
+        HGLogger->debug("No exit status was available for $sendmail; the $kind "
+                      . "notice was written but delivery is unconfirmed.");
+    }
 
     HGLogger->info("Notice sent to $to: $subject");
     return 1;

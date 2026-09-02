@@ -191,7 +191,7 @@ sub refresh {
         return 0;
     }
 
-    my ($entries, $stats) = $class->parse_with_stats($tmp, $entry->{max});
+    my ($entries, $stats) = $class->parse_with_stats($tmp, $entry->{max}, $config);
     if (my $why = $class->_reject_reason($entry, $entries, $stats, $config, $opt{force})) {
         unlink($tmp);
         HGLogger->error("Blocklist $entry->{name} was not applied because $why; "
@@ -245,8 +245,8 @@ sub _download {
 # kept only if it validates as an address, so anything unexpected - an HTML
 # error page, a changed format - simply yields nothing.
 sub parse_file {
-    my ($class, $file, $max) = @_;
-    my ($entries) = $class->parse_with_stats($file, $max);
+    my ($class, $file, $max, $config) = @_;
+    my ($entries) = $class->parse_with_stats($file, $max, $config);
     return @$entries;
 }
 
@@ -263,12 +263,15 @@ sub parse_file {
 #   valid       lines whose first token was an address or CIDR range
 #   kept        entries actually stored, so valid minus duplicates
 #   capped      true when reading stopped at the list's configured maximum
+#   too_broad   entries reaching further than MIN_PREFIX4/MIN_PREFIX6 allow
+#   broad_eg    one of those, to name in the message
 sub parse_with_stats {
-    my ($class, $file, $max) = @_;
+    my ($class, $file, $max, $config) = @_;
     $max = 0 unless defined $max && $max =~ /^\d+$/;
 
     my @entries;
-    my %stats = (considered => 0, valid => 0, kept => 0, capped => 0);
+    my %stats = (considered => 0, valid => 0, kept => 0, capped => 0,
+                 too_broad => 0, broad_eg => undef);
 
     open(my $fh, '<', $file) or return (\@entries, \%stats);
 
@@ -287,6 +290,17 @@ sub parse_with_stats {
 
         next unless HGConfig->valid_ipv4($token) || HGConfig->valid_ipv6($token);
         $stats{valid}++;
+
+        # An entry reaching further than the floor is counted and dropped, and
+        # _reject_reason refuses the whole download over it. Dropping it
+        # quietly and keeping the rest would be worse than either extreme: the
+        # list would apply, minus the one entry that says the provider is not
+        # serving what it used to. See HGConfig::too_broad.
+        if (HGConfig::too_broad($token, $config)) {
+            $stats{too_broad}++;
+            $stats{broad_eg} //= $token;
+            next;
+        }
 
         # Counted as valid before the duplicate check, so a provider that
         # repeats itself is not mistaken for one publishing junk.
@@ -309,13 +323,25 @@ sub parse_with_stats {
 # The cache holds one validated address per line, so counting lines is
 # counting entries.
 sub cached_count {
-    my ($class, $name) = @_;
+    my ($class, $name, $config) = @_;
+
+    # Counts what would actually load, so the shrink comparison is like with
+    # like: the new count is taken after the prefix floor has been applied, and
+    # comparing it against a previous count taken before one would read a
+    # tightened floor as a provider truncating its list.
+    #
+    # Silent, unlike the readers. This is a counter, and the condition it would
+    # report is already reported by whichever reader loads the file.
+    $config = HGConfig::resolve_config($config);
 
     my $file = $class->cache_file($name);
     open(my $fh, '<', $file) or return undef;
     my $count = 0;
     while (my $line = <$fh>) {
-        $count++ if $line =~ /\S/;
+        chomp $line;
+        next unless $line =~ /\S/;
+        next if HGConfig::too_broad($line, $config);
+        $count++;
     }
     close($fh);
     return $count;
@@ -362,7 +388,40 @@ sub _percent {
 sub _reject_reason {
     my ($class, $entry, $entries, $stats, $config, $force) = @_;
 
+    # An entry reaching further than the floor allows, before anything else.
+    #
+    # There is no override for this and there is deliberately no force flag
+    # either, unlike the shrink check below. The shrink check is a heuristic
+    # about a provider having a bad day; this one is a list that would take the
+    # host off the network, and "run it again with force" is not a thing to
+    # offer for that. Raise MIN_PREFIX4 or MIN_PREFIX6 if the range is really
+    # meant to be blocked.
+    if ($stats->{too_broad}) {
+        return "$stats->{too_broad} of its entries reach further than "
+             . "MIN_PREFIX4/MIN_PREFIX6 allow"
+             . (defined $stats->{broad_eg} ? " (for example $stats->{broad_eg})"
+                                           : '')
+             . ", and a range that wide in a block list drops traffic from "
+             . "everyone who is not allowlisted";
+    }
+
     return "it contained no usable addresses" unless @$entries;
+
+    # More entries than the ipset can hold.
+    #
+    # The sets are created with maxelem, so a list past that makes ipset
+    # restore abort, which makes the slot incomplete, which makes start()
+    # refuse to activate it. Failing closed there is right - but the oversized
+    # copy is already cached by then, so every later reload fails the same way,
+    # including the one an administrator runs to fix a lockout or apply an
+    # emergency block. Refusing the download instead keeps the previous copy
+    # and keeps the firewall reloadable.
+    if (scalar(@$entries) > $HGConfig::SET_MAXELEM) {
+        return "it holds " . scalar(@$entries) . " entries, more than the "
+             . "$HGConfig::SET_MAXELEM an ipset here can hold. Loading it "
+             . "would make every firewall reload fail. Set a MAX for this list "
+             . "in blocklists.conf, or lower BLOCKLIST_MAX_SIZE";
+    }
 
     my $considered = $stats->{considered} || 0;
     my $min = _percent($config, 'BLOCKLIST_MIN_VALID_PERCENT', $MIN_VALID_PERCENT);
@@ -385,7 +444,7 @@ sub _reject_reason {
     # allowed to be, so it has not shrunk in any sense worth acting on.
     return undef if $stats->{capped};
 
-    my $previous = $class->cached_count($entry->{name});
+    my $previous = $class->cached_count($entry->{name}, $config);
     return undef unless defined $previous && $previous >= $SHRINK_FLOOR;
 
     my $floor = int($previous * (100 - $shrink) / 100);
@@ -408,7 +467,12 @@ sub _reject_reason {
 # Returns (v4, v6). Counted line by line, so a list of any size costs one file
 # read and no memory.
 sub cached_counts {
-    my ($class, $name) = @_;
+    my ($class, $name, $config) = @_;
+
+    # The floor applies here too, so the number the WHM page prints is the
+    # number the firewall would load rather than the number of lines in the
+    # file. Silent, for the reason cached_count gives.
+    $config = HGConfig::resolve_config($config);
 
     my ($v4, $v6) = (0, 0);
     my $file = $class->cache_file($name);
@@ -416,6 +480,7 @@ sub cached_counts {
     while (my $line = <$fh>) {
         chomp $line;
         next unless length $line;
+        next if HGConfig::too_broad($line, $config);
         if    (HGConfig->valid_ipv4($line)) { $v4++ }
         elsif (HGConfig->valid_ipv6($line)) { $v6++ }
     }
@@ -431,11 +496,23 @@ sub cached_counts {
 # distinction both looked the same as a list with no entries, and a caller
 # applying the list to the running firewall would do nothing at all and say
 # nothing about it.
+#
+# The prefix floor is applied here as well as at download time. The cache is
+# written from entries that already passed it, so on the ordinary path this
+# finds nothing - but a cache file restored from a backup, edited by hand, or
+# left by a release that had no floor does not go through the download path at
+# all, and this is what the firewall actually loads from.
 sub cached_entries {
-    my ($class, $name, $stats) = @_;
+    my ($class, $name, $stats, $config) = @_;
     $stats ||= {};
     $stats->{missing}    = 0;
     $stats->{unreadable} = 0;
+    $stats->{too_broad}  = 0;
+    $stats->{broad_eg}   = undef;
+
+    # Resolved once, not once per entry: the floor has to be the one the
+    # firewall loads with, or this reports on sets it disagrees with.
+    $config = HGConfig::resolve_config($config);
 
     my (@v4, @v6);
 
@@ -459,6 +536,13 @@ sub cached_entries {
     while (my $line = <$fh>) {
         chomp $line;
         next unless length $line;
+
+        if (HGConfig::too_broad($line, $config)) {
+            $stats->{too_broad}++;
+            $stats->{broad_eg} //= $line;
+            next;
+        }
+
         if (HGConfig->valid_ipv4($line)) {
             push @v4, $line;
         } elsif (HGConfig->valid_ipv6($line)) {
@@ -466,6 +550,18 @@ sub cached_entries {
         }
     }
     close($fh);
+
+    if ($stats->{too_broad}) {
+        HGLogger->error("Blocklist $name: $stats->{too_broad} cached "
+                      . "entry(s) reach further than MIN_PREFIX4/MIN_PREFIX6 "
+                      . "allow"
+                      . (defined $stats->{broad_eg}
+                         ? " (for example $stats->{broad_eg})" : '')
+                      . " and are NOT being loaded. A range that wide in a "
+                      . "block list drops traffic from everyone who is not "
+                      . "allowlisted. Re-download the list with "
+                      . "'hostguard -b force'.");
+    }
 
     return (\@v4, \@v6);
 }

@@ -404,6 +404,33 @@ sub parse {
     my ($class, $line, $key, $config) = @_;
 
     return undef unless defined $line && length $line;
+
+    # No key, no authentication - and therefore nothing to parse.
+    #
+    # secret() returns the empty string for every key it refuses: missing,
+    # readable by group or other, owned by someone other than root, or short
+    # enough to search. This did not check, and hmac_sha256_hex($payload, '')
+    # is a perfectly good digest under a perfectly guessable key. Anyone who
+    # could reach the port from a configured member address, and who knew or
+    # guessed that the key had been refused, could sign whatever they liked -
+    # including an ALLOW that appends an address to allow.conf on every member,
+    # above every block, permanently.
+    #
+    # listeners() already refuses to open a socket without a usable key, so
+    # this was reachable only when a key degraded while the daemon was running:
+    # a restored backup, a configuration-management run, a key copied between
+    # members under a permissive umask. That is not a rare way for a file mode
+    # to change, and the daemon holds its sockets for weeks.
+    #
+    # broadcast() has always made this check. The header of this module says
+    # callers "refuse to send or accept anything"; this is the accept half.
+    unless (defined $key && length $key) {
+        HGLogger->error("Cluster message refused: no usable shared key, so "
+                      . "nothing can be authenticated. Check the key with "
+                      . "'hostguard --cluster list'.");
+        return undef;
+    }
+
     chomp $line;
     $line =~ s/\r$//;
 

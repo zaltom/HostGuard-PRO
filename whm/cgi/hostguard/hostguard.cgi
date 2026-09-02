@@ -955,7 +955,7 @@ HTML
         # this page only wants a number - which on three large lists meant
         # several million scalars to print three integers, in a process that has
         # lifted its own memory limits.
-        my ($v4, $v6) = HGBlocklist->cached_counts($entry->{name});
+        my ($v4, $v6) = HGBlocklist->cached_counts($entry->{name}, $conf);
         my $count = $v4 + $v6;
         my $age   = HGBlocklist->age($entry);
         my $when  = defined $age ? _format_duration($age) . " ago" : "never downloaded";
@@ -1040,8 +1040,8 @@ HTML
     for my $cc (@codes) {
         # Counted, not loaded, for the same reason as the block list page. A
         # large country's zone file holds hundreds of thousands of ranges.
-        my $v4 = HGGeo->cached_count($cc, 'inet')  // 0;
-        my $v6 = HGGeo->cached_count($cc, 'inet6') // 0;
+        my $v4 = HGGeo->cached_count($cc, 'inet', $conf)  // 0;
+        my $v6 = HGGeo->cached_count($cc, 'inet6', $conf) // 0;
         my $age = HGGeo->age($cc, 'inet');
         my $when = defined $age ? _format_duration($age) . " ago" : "never downloaded";
         my $due  = HGGeo->is_due($cc, $conf, 'inet') ? " (due)" : "";

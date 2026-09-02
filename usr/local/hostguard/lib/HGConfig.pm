@@ -28,21 +28,44 @@ sub loadconfig {
     $file //= "$CONFIG_DIR/hostguard.conf";
 
     my %config;
+    my %dup;
     open(my $fh, '<', $file) or die "Cannot open config $file: $!\n";
     flock($fh, LOCK_SH);
     while (my $line = <$fh>) {
         chomp $line;
         $line =~ s/\s*#.*$// unless $line =~ /^#/;
         next if $line =~ /^\s*#/ || $line =~ /^\s*$/;
+
+        my ($key, $value);
         if ($line =~ /^\s*(\w+)\s*=\s*"([^"]*)"\s*$/) {
-            $config{$1} = $2;
+            ($key, $value) = ($1, $2);
         } elsif ($line =~ /^\s*(\w+)\s*=\s*'([^']*)'\s*$/) {
-            $config{$1} = $2;
+            ($key, $value) = ($1, $2);
         } elsif ($line =~ /^\s*(\w+)\s*=\s*(\S+)\s*$/) {
-            $config{$1} = $2;
+            ($key, $value) = ($1, $2);
         }
+        next unless defined $key;
+
+        # A key that appears twice is worth saying out loud.
+        #
+        # The last one wins here, which is a choice this makes silently, and
+        # set() used to rewrite the first - so on a file with a duplicate,
+        # "hostguard --preset high" printed a full before-and-after table for
+        # every setting it changed and changed none of them. set() now rewrites
+        # them all, and this says why there was more than one.
+        $dup{$key}++ if exists $config{$key};
+        $config{$key} = $value;
     }
     close($fh);
+
+    if (%dup) {
+        HGLogger->log_warn("$file sets "
+                         . join(', ', map { "$_ " . ($dup{$_} + 1) . " times" }
+                                      sort keys %dup)
+                         . ". The last value of each is the one in force. "
+                         . "Remove the earlier lines: a duplicated setting is "
+                         . "one nobody can read the file and be sure of.");
+    }
 
     return bless { config => \%config, file => $file }, $class;
 }
@@ -87,14 +110,32 @@ sub set {
         my @lines = <$fh>;
         close($fh);
 
+        # Every occurrence, not the first.
+        #
+        # This rewrote the first matching line and stopped. loadconfig reads
+        # the file top to bottom and lets each assignment overwrite the last,
+        # so the *last* occurrence is the one in force - and the two disagreed.
+        # On a hostguard.conf with a duplicated key, which the WHM
+        # whole-file editor and an upgrade merge both produce easily, set()
+        # reported success, updated its own in-memory copy so the calling
+        # process agreed with it, and changed nothing that any later process
+        # would read. "hostguard --preset high" was the caller that mattered:
+        # it printed the whole before-and-after table and applied none of it.
+        #
+        # The first match takes the new value and the rest are dropped, so the
+        # file comes out of this with exactly one line for the key however many
+        # it went in with.
         my $found = 0;
+        my @out;
         for my $line (@lines) {
-            if ($line =~ /^\s*\Q$key\E\s*=/) {
-                $line = "$key = \"$value\"\n";
-                $found = 1;
-                last;
+            unless ($line =~ /^\s*\Q$key\E\s*=/) {
+                push @out, $line;
+                next;
             }
+            next if $found++;          # a duplicate: drop it
+            push @out, "$key = \"$value\"\n";
         }
+        @lines = @out;
         push @lines, "$key = \"$value\"\n" unless $found;
 
         _write_atomic($file, join('', @lines));
@@ -245,6 +286,121 @@ sub valid_ipv6 {
 sub valid_ip {
     my ($class, $ip) = @_;
     return $class->valid_ipv4($ip) || $class->valid_ipv6($ip);
+}
+
+###############################################################################
+# How wide a downloaded range may be
+###############################################################################
+#
+# The block lists and the country zone files are the two places where data this
+# host has not written decides what the firewall drops, and the only test
+# applied to an entry was that it parsed. valid_ipv4 accepts a prefix length of
+# zero, so "0.0.0.0/0" is a valid block list entry - and one line is the whole
+# attack.
+#
+# What it costs: the live rule is a set match sending the source to the drop
+# chain, so a zero-length prefix in that set drops every inbound packet from
+# every source that is not allowlisted and not already established. Every site
+# on the host goes off the air. The allowlist ordering protects the
+# administrator's own access and does nothing at all for the service the host
+# exists to run.
+#
+# What it defeats: nothing. BLOCKLIST_MIN_VALID_PERCENT asks what proportion of
+# the file parsed as addresses, and a list with one line added is still
+# overwhelmingly addresses. BLOCKLIST_MAX_SHRINK_PERCENT asks whether the count
+# fell, and it did not. Both are tests of the file's shape; neither is a test
+# of how far an entry reaches. And the apply path does not need a reload: the
+# daemon's refresh swaps the new contents into the live set directly.
+#
+# So a floor, applied where the data is parsed. A provider with a legitimate
+# reason to block a /8 is asking for a decision a person should make.
+our $MIN_PREFIX4 = 8;
+our $MIN_PREFIX6 = 32;
+
+# How many entries one ipset is created to hold.
+#
+# Stated once, because two places have to agree about it: HGFirewall creates
+# the sets with this as maxelem, and HGBlocklist refuses a download that would
+# not fit. They disagreed by being written twice - the number was a literal in
+# the set creation and nowhere else - and the consequence was that an oversized
+# list was accepted, cached, and then failed to load on every reload from then
+# on, because ipset restore aborts at maxelem and start() will not activate an
+# incomplete slot. Correct, and permanent: the bad copy was already on disk.
+our $SET_MAXELEM = 1000000;
+
+# The floor in force, from configuration, bounded to something meaningful.
+#
+# 0 switches the check off, which is an administrator's call to make and is
+# recorded here rather than hidden: a floor of 0 accepts 0.0.0.0/0.
+sub min_prefix {
+    my ($config, $family) = @_;
+
+    my $v6  = (defined $family && $family eq 'inet6');
+    my $key = $v6 ? 'MIN_PREFIX6' : 'MIN_PREFIX4';
+    my $max = $v6 ? 128 : 32;
+    my $def = $v6 ? $MIN_PREFIX6 : $MIN_PREFIX4;
+
+    # Deliberately no fallback to loading the file here. This is called once
+    # per entry, and a list runs to hundreds of thousands of them; a read per
+    # entry would cost more than the check saves. Callers that may not have a
+    # configuration resolve one first - see HGConfig::resolve_config, which the
+    # cache readers call once on the way in.
+    my $value;
+    if (ref $config eq 'HASH')      { $value = $config->{$key} }
+    elsif (ref $config)             { $value = eval { $config->get($key) } }
+
+    return $def unless defined $value && $value =~ /^\d+$/ && $value <= $max;
+    return $value;
+}
+
+# A configuration to judge entries against, loading one if the caller had none.
+#
+# Called once by each cache reader, not once per entry.
+#
+# Falling back to the built-in floor instead looks harmless and is not: the
+# firewall loads its sets using the configured floor, so a reader using a
+# different one disagrees with the kernel about what those sets contain. On a
+# host that has lowered MIN_PREFIX4 - which the setting documents as supported,
+# including 0 to switch the check off - "hostguard -s" and the WHM page counted
+# fewer entries than the firewall was matching on, and logged an ERROR for each
+# range telling the operator to re-download data their own configuration had
+# already accepted.
+#
+# Every caller inside the firewall threads its configuration through, and
+# should. This is so that one which does not is wrong about nothing.
+sub resolve_config {
+    my ($config) = @_;
+    return $config if defined $config;
+    return eval { HGConfig->loadconfig() };
+}
+
+# The prefix length an entry carries. A bare address is a full-length prefix.
+sub prefix_len {
+    my ($entry) = @_;
+    return undef unless defined $entry;
+
+    my ($addr, $bits) = split(m{/}, $entry, 2);
+    return undef unless defined $addr && length $addr;
+
+    my $v6 = ($addr =~ /:/) ? 1 : 0;
+    return $v6 ? 128 : 32 unless defined $bits && length $bits;
+    return undef unless $bits =~ /^\d{1,3}$/;
+    return undef if $bits > ($v6 ? 128 : 32);
+    return $bits;
+}
+
+# True when an entry reaches further than the configured floor permits.
+sub too_broad {
+    my ($entry, $config) = @_;
+
+    my $bits = prefix_len($entry);
+    return 0 unless defined $bits;
+
+    my $v6    = (defined $entry && $entry =~ /:/) ? 'inet6' : 'inet';
+    my $floor = min_prefix($config, $v6);
+    return 0 unless $floor > 0;
+
+    return $bits < $floor ? 1 : 0;
 }
 
 # Validate port list string
@@ -504,13 +660,44 @@ sub download_capped {
                 '--output', '-',
                 $url);
     } elsif (my $wget = find_bin('wget')) {
+        # The same confinement curl gets, as far as wget can express it.
+        #
+        # It had none of it: only --max-redirect. curl is told which schemes it
+        # may use and which it may be redirected to, and the reasoning above
+        # applies word for word to wget - a provider that has been compromised
+        # answers with a redirect, and an unrestricted follow goes wherever it
+        # is pointed. Cloud metadata on 169.254.169.254 and anything listening
+        # on loopback are both plain HTTP, and both were reachable here as root
+        # from inside the host.
+        #
+        # --https-only is what closes that for an https source: wget then
+        # refuses to be redirected to http at all, and every list and zone file
+        # this software ships is https. It is applied per URL rather than
+        # unconditionally, because an operator who configured an http:// source
+        # has already chosen plaintext and refusing it here would break a
+        # working configuration to make a point.
+        my @https = ($url =~ m{^https://}i) ? ('--https-only') : ();
+
         @cmd = ($wget,
                 '--quiet',
                 '--timeout=' . $timeout,
                 '--max-redirect=3',
                 '--tries=2',
+                @https,
                 '--output-document=-',
                 $url);
+
+        # wget is the fallback, and it is a weaker one than it looks. Besides
+        # the redirect confinement above it has no equivalent of --proto, and
+        # no option that bounds a transfer in total - which is why the size cap
+        # is enforced in this process rather than by the downloader. Said once,
+        # here, so the difference is on the record.
+        HGLogger->log_warn("Downloading with wget; curl was not found. wget "
+                         . "cannot restrict which protocols a redirect may "
+                         . "use, so a compromised provider has more room here "
+                         . "than it would with curl. Installing curl is "
+                         . "worth doing on a host that fetches block lists.")
+            unless $url =~ m{^https://}i;
     } else {
         return (-1, 'neither curl nor wget is installed');
     }

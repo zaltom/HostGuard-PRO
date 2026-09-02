@@ -81,6 +81,25 @@ my @CUSTOM_PATTERNS;
 # Set when %block_history has changed since it was last written out.
 my $BLOCK_HISTORY_DIRTY = 0;
 
+# The listening sockets, held at file scope rather than inside main().
+#
+# The cluster key is checked when the listeners are opened, which happens at
+# startup and on reload and then not again for as long as the daemon runs -
+# weeks. A key whose mode or ownership degrades in that time leaves the socket
+# open and accepting. HGCluster::parse now refuses to authenticate without a
+# usable key, so nothing gets through either way; closing the socket as well
+# means the port stops answering rather than answering and refusing, which is
+# what "the cluster is not configured" should look like from outside.
+#
+# The periodic check needs to reach these, so they live here.
+my @CLUSTER_SOCKS;
+my $NOTICE_SOCK;
+
+# When the notice responder may next be reopened after a failed bind, and how
+# long to wait. See sync_notice_listener.
+my $NOTICE_RETRY_AFTER = 0;
+my $NOTICE_RETRY_INTERVAL = 60;
+
 ###############################################################################
 # Configuration sanity
 ###############################################################################
@@ -114,6 +133,23 @@ $SIG{USR1} = sub { dump_state(); };
 # A child that outlives its parent - the mailer, a block report hook - must
 # not be left as a zombie for the lifetime of the daemon.
 $SIG{CHLD} = 'IGNORE';
+
+# Writing to a socket whose peer has gone must never be fatal.
+#
+# SIGPIPE's default action terminates the process, and Perl installs no
+# handler of its own. This daemon writes to three kinds of socket - the cluster
+# connections it opens, the pipe to the mailer, and the block notice responder
+# - and every one of those peers can disappear mid-write. The notice responder
+# is the sharpest case, because every peer on that socket is an address the
+# firewall has already blocked: the population that can close a connection
+# early and the population attacking the host are the same set.
+#
+# Each of those three sites also sets this locally, which is what makes each
+# module correct on its own. This is here so that the daemon cannot be killed
+# this way by a write site that forgets - it is the difference between three
+# functions being right and the process being safe. With PIPE ignored a failed
+# write returns EPIPE, which every one of them already checks.
+$SIG{PIPE} = 'IGNORE';
 
 ###############################################################################
 # Bounded tracking tables
@@ -293,7 +329,101 @@ my @TASKS = (
         key      => undef,
         run      => sub { save_block_history() if $BLOCK_HISTORY_DIRTY; },
     },
+    # The cluster key is only examined when the listeners are opened, and this
+    # process holds them for weeks. A key that stops being safe in that time
+    # would otherwise leave the port answering until the next reload.
+    {   name     => 'cluster_key',
+        interval => 60,
+        key      => 'CLUSTER_ENABLE',
+        run      => \&check_cluster_key,
+    },
 );
+
+# Close the cluster listeners if the shared key has stopped being usable.
+#
+# HGCluster::parse refuses to authenticate anything without a usable key, so
+# nothing gets through regardless. What this adds is that the port stops
+# answering: a cluster whose key has been refused is not configured, and a
+# port that accepts connections in order to reject them is a worse description
+# of that than a port that is closed.
+#
+# Reopened by a reload once the key is fixed, which is what the message says
+# to do. Nothing reopens it automatically: a key that has been made safe again
+# is an administrator's deliberate act, and it is worth their confirming the
+# cluster came back rather than assuming it did.
+# Open or close the notice responder to match whether the firewall is running.
+#
+# The responder binds every interface, because a nat REDIRECT rewrites the
+# destination to the address the packet arrived on and a socket on loopback
+# would never receive one. What keeps that from being an exposed service is not
+# the bind but the ruleset: NOTICE_PORT is absent from TCP_IN, and the only
+# rule admitting traffic to it matches sources in the temporary block set, so
+# everything else falls through to the drop at the end of the input chain.
+#
+# That reasoning holds exactly as long as there is a ruleset. This daemon is a
+# separate unit from the firewall, and hostguardd.service says
+# "Wants=hostguard.service", which orders the two and does not tie their
+# lifetimes: "hostguard -x" stops the firewall and leaves this process running.
+# The responder was then bound to every interface with nothing whatsoever in
+# front of it - reachable by anyone, serving a page to strangers and giving
+# them a way to spend the main loop's socket budget.
+#
+# So the socket follows the firewall. It is opened when a ruleset is in force
+# and closed when one is not, which also covers the case this unit's ordering
+# does not guarantee: the daemon starting before, or without, a firewall that
+# failed to come up.
+#
+# Checked on the main loop rather than on a timer. It costs one stat of a file
+# that is almost always in the page cache, and it bounds the window between the
+# firewall stopping and the port closing to a single parse interval - three
+# seconds by default - rather than to whatever a task interval happened to be.
+sub sync_notice_listener {
+    my $wanted = HGNotice->enabled(\%config)
+              && HGFirewall->status()->{running};
+
+    if ($wanted && !$NOTICE_SOCK) {
+        # An open that fails is not retried on every pass.
+        #
+        # listener() reports why it could not bind - the port taken by
+        # something else is the usual reason - and returns undef. Since this
+        # runs once per parse interval, retrying immediately would put that
+        # message in the log every three seconds for as long as the condition
+        # lasted. The condition is worth reporting; a thousand lines an hour of
+        # it is worth nothing, and it would bury the log this daemon exists to
+        # write.
+        return if $NOTICE_RETRY_AFTER && time() < $NOTICE_RETRY_AFTER;
+
+        $NOTICE_SOCK = HGNotice->listener(\%config);
+        $NOTICE_RETRY_AFTER = $NOTICE_SOCK ? 0 : time() + $NOTICE_RETRY_INTERVAL;
+        return;
+    }
+
+    if (!$wanted && $NOTICE_SOCK) {
+        close($NOTICE_SOCK);
+        $NOTICE_SOCK = undef;
+        $NOTICE_RETRY_AFTER = 0;
+        HGLogger->info("Block notice responder closed: no ruleset is in force, "
+                     . "so nothing would be filtering its port. It reopens by "
+                     . "itself when the firewall is started again.");
+    }
+    return;
+}
+
+sub check_cluster_key {
+    return unless @CLUSTER_SOCKS;
+
+    my ($status, $message) = HGCluster->key_status(\%config);
+    return if $status eq 'ok';
+
+    HGLogger->error("Cluster: the shared key is no longer usable ($status): "
+                  . "$message. Closing the cluster listener(s); no message "
+                  . "will be sent or accepted until this is fixed and the "
+                  . "daemon is reloaded with 'systemctl reload hostguardd'.");
+
+    close($_) for grep { $_ } @CLUSTER_SOCKS;
+    @CLUSTER_SOCKS = ();
+    return;
+}
 
 # When each task last ran.
 my %last_run;
@@ -362,8 +492,11 @@ sub main {
     #
     # The cluster returns a list: a dual-stack host needs one socket per
     # address family.
-    my @cluster_socks = HGCluster->listeners(\%config);
-    my $notice_sock   = HGNotice->listener(\%config);
+    @CLUSTER_SOCKS = HGCluster->listeners(\%config);
+
+    # The notice responder is opened by sync_notice_listener, which will not
+    # open it unless a ruleset is actually in force. See that sub.
+    sync_notice_listener();
 
     # Every task is treated as having just run, so none of them fires in the
     # first cycle. A daemon that ran every check at once on startup would make
@@ -384,17 +517,23 @@ sub main {
             HGRelay->reset_state();
 
             # The listeners may have been switched on or off, or moved.
-            close($_) for grep { $_ } @cluster_socks;
-            close($notice_sock) if $notice_sock;
-            @cluster_socks = HGCluster->listeners(\%config);
-            $notice_sock   = HGNotice->listener(\%config);
+            close($_) for grep { $_ } @CLUSTER_SOCKS;
+            close($NOTICE_SOCK) if $NOTICE_SOCK;
+            $NOTICE_SOCK = undef;
+            @CLUSTER_SOCKS = HGCluster->listeners(\%config);
+            sync_notice_listener();
 
             $RELOAD = 0;
             HGLogger->info("Configuration reloaded.");
         }
 
         read_logs(\%log_handles);
-        service_sockets(\@cluster_socks, $notice_sock);
+
+        # Before the sockets are serviced, not after: a responder whose
+        # ruleset has gone should not answer one more connection.
+        sync_notice_listener();
+
+        service_sockets(\@CLUSTER_SOCKS, $NOTICE_SOCK);
         expire_counters();
         run_due_tasks();
 
@@ -404,8 +543,8 @@ sub main {
     }
 
     HGLogger->info("HostGuard Pro daemon shutting down (PID $$)");
-    close($_) for grep { $_ } @cluster_socks;
-    close($notice_sock) if $notice_sock;
+    close($_) for grep { $_ } @CLUSTER_SOCKS;
+    close($NOTICE_SOCK) if $NOTICE_SOCK;
     HGRelay->flush();
     HGAlert->reset_state();
     save_block_history();
