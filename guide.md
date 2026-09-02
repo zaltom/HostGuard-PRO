@@ -666,7 +666,7 @@ NAME|INTERVAL|MAX|URL
 | `NAME` | Alphanumeric, max 24 characters. Names the ipset holding the list. |
 | `INTERVAL` | Refresh interval in seconds. Values below 3600 are raised to 3600. |
 | `MAX` | Maximum addresses to import, or `0` for the whole list. |
-| `URL` | `http://` or `https://` address of the list. |
+| `URL` | `https://` address of the list. A plain `http://` source is refused unless `BLOCKLIST_ALLOW_HTTP` is set. |
 
 Several well-known lists ship commented out. Remove the leading `#` to enable
 one:
@@ -799,6 +799,7 @@ Country zone files work the same way, for the same reasons.
 | `BLOCKLIST_ENABLE` | Apply the configured lists (1=yes, 0=no) |
 | `BLOCKLIST_TIMEOUT` | Seconds to wait for a download |
 | `BLOCKLIST_MAX_SIZE` | Largest download accepted, in bytes |
+| `BLOCKLIST_ALLOW_HTTP` | Accept a source served over plain http (1=yes, 0=no) |
 | `BLOCKLIST_MIN_VALID_PERCENT` | Share of content lines that must be addresses (0 disables) |
 | `BLOCKLIST_MAX_SHRINK_PERCENT` | How far a list may fall below its previous copy (100 disables) |
 
@@ -823,6 +824,50 @@ so a single misbehaving list provider stopped log reading, block expiry and
 everything else with it.
 
 The same limit and timeout govern the country zone files.
+
+### Where a download is allowed to go
+
+Block lists and country zone files are the only data this host asks a stranger
+for, and it asks as root. Two things are decided before the request is made,
+because `curl` cannot be told either of them.
+
+**The address.** A provider that has been taken over, a DNS answer that has
+been tampered with, or a redirect from either points a root process at whatever
+the attacker names, and the interesting targets are all inside the host: cloud
+instance metadata on `169.254.169.254`, an unauthenticated admin service on
+loopback, a database on the private network. Nothing of the response comes back
+to the attacker - it is validated address by address and discarded - but the
+request is made, and a request is enough for anything that acts on being asked.
+So the host name is resolved by HostGuard Pro first, every address it answers
+with is checked against loopback, private, link-local, carrier-grade NAT,
+benchmarking, multicast and reserved space, and the fetch is refused if any one
+of them is in there. `curl` is then pinned with `--resolve` to the addresses
+that passed, so the second lookup cannot answer differently from the first.
+
+**The hops.** Redirects are followed by HostGuard Pro rather than by `curl`,
+one at a time, up to four, and each new URL goes through the same check as the
+one an administrator configured. `curl --location` follows them inside a single
+process where the destination is never visible to anything that could refuse
+it; `--proto-redir`, which is the most that can be said there, confines the
+scheme and says nothing about the address.
+
+`wget` is the fallback and a weaker one. It has no `--resolve`, so a checked
+address cannot be pinned, and no `--proto`. Redirects are refused outright
+under `wget` rather than followed. Installing `curl` is worth doing on a host
+that fetches lists.
+
+**The transport.** A plain `http://` source is refused unless
+`BLOCKLIST_ALLOW_HTTP` is set to 1. Over plain HTTP the reply is written by
+whoever is on the path, and the reply is what the firewall drops: somebody in
+that position can empty a list, or fill one with the addresses of the customers
+this server hosts, and every check below would find nothing wrong with what
+arrived. The setting exists for an internal mirror that genuinely has no
+certificate. `GEO_SOURCE` is judged by the same setting, being the same kind of
+data over the same transport deciding the same thing.
+
+None of this replaces the checks on the content below. A list fetched from an
+address that passed is still parsed, still measured against the copy it
+replaces, and still refused if it does not look like a block list.
 
 Enabling a list blocks every network it names, so use sources you trust and
 check the entry count with `hostguard -s` after the first update.

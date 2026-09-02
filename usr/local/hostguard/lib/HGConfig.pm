@@ -10,6 +10,10 @@ use Fcntl qw(:DEFAULT :flock);
 # collected without ever blocking, and its child leaves without running
 # this process's exit handlers.
 use POSIX qw(:sys_wait_h _exit);
+# Resolving a download's host before it is fetched, so that where the request
+# will actually go is known to this process rather than only to curl. See the
+# Downloading section.
+use Socket;
 # For safe_to_exec's explanation of a refused binary. Loaded lazily rather than
 # with "use" because HGLogger has no dependency on this module and a circular
 # use would be gratuitous.
@@ -612,6 +616,240 @@ sub run_command {
     return ($rc, defined $out ? $out : '');
 }
 
+###############################################################################
+# Downloading
+###############################################################################
+#
+# The block lists and the country zone files are the only data this host asks
+# a stranger for, and it asks as root. Three things are decided here rather
+# than left to curl, because curl cannot express any of them.
+#
+#   Where the request may go. A provider that has been taken over, a DNS
+#   answer that has been tampered with, or a redirect from either points a
+#   root process at whatever the attacker names, and the interesting targets
+#   are all inside the host: cloud instance metadata on 169.254.169.254, an
+#   unauthenticated admin service on loopback, a database on the private
+#   network. Nothing of the response comes back to the attacker - it is
+#   validated address by address and discarded - but the request is made, and
+#   a request is enough for anything that acts on being asked. curl can be
+#   told which schemes it may use; it cannot be told that those addresses are
+#   not places a public block list lives. So every hop is resolved here, every
+#   resolved address is checked against @FORBIDDEN_RANGES, and the connection
+#   is pinned with --resolve to the addresses that passed, so the name cannot
+#   answer differently the second time it is asked.
+#
+#   How many hops, and past whose gate. Redirects are followed by this code,
+#   one at a time, each new URL going through the same check as the first.
+#   curl's own --location follows them inside a single process, where the
+#   destination is never visible to anything that could refuse it - which is
+#   why --proto-redir, which was all this had, is not enough: it confines the
+#   scheme and says nothing about the address.
+#
+#   Whether the transport is authenticated at all. Over plain http:// the
+#   answer comes from whoever is on the path, and the answer decides what the
+#   firewall drops: an attacker who can rewrite one response can empty a block
+#   list, or fill one with the addresses of a customer's users. It is refused
+#   unless the caller passes allow_http, which the callers take from
+#   BLOCKLIST_ALLOW_HTTP.
+#
+# None of this replaces the checks on the content. A list fetched from an
+# address that passed here is still parsed, still measured against the copy it
+# replaces, and still refused if it does not look like a block list.
+
+# Address ranges a download may never be directed at, whether by the
+# configured URL, by DNS, or by a redirect.
+#
+# Everything that is not a place on the public internet: this host, this
+# host's networks, link-local (which is where instance metadata lives on every
+# major cloud), carrier-grade NAT, benchmarking, multicast and reserved space.
+# A block list served from any of them is not a block list.
+our @FORBIDDEN_RANGES = (
+    '0.0.0.0/8',            # this network
+    '10.0.0.0/8',           # private
+    '100.64.0.0/10',        # carrier-grade NAT
+    '127.0.0.0/8',          # loopback
+    '169.254.0.0/16',       # link-local, and cloud instance metadata
+    '172.16.0.0/12',        # private
+    '192.0.0.0/24',         # IETF protocol assignments
+    '192.0.2.0/24',         # documentation
+    '192.88.99.0/24',       # 6to4 relay anycast
+    '192.168.0.0/16',       # private
+    '198.18.0.0/15',        # benchmarking
+    '198.51.100.0/24',      # documentation
+    '203.0.113.0/24',       # documentation
+    '224.0.0.0/4',          # multicast
+    '240.0.0.0/4',          # reserved, and 255.255.255.255 with it
+    '::/128',               # unspecified
+    '::1/128',              # loopback
+    '100::/64',             # discard-only
+    '2001:db8::/32',        # documentation
+    'fc00::/7',             # unique local
+    'fe80::/10',            # link-local
+    'ff00::/8',             # multicast
+);
+
+# How many redirects a source may answer with before the fetch is abandoned.
+our $MAX_REDIRECTS = 4;
+
+# Split an http(s) URL into its parts, or undef if it is not one this fetches.
+#
+# Credentials in the authority are refused rather than honoured: nothing here
+# has a reason to send them, and "http://safe.example@10.0.0.1/" reads to a
+# person as a request to safe.example and to a client as a request to
+# 10.0.0.1. The address check below would catch that one, but a URL nobody can
+# read correctly has no business being fetched in the first place.
+sub split_url {
+    my ($url) = @_;
+    return undef unless defined $url && length $url;
+    return undef if $url =~ /[\s[:cntrl:]]/;
+    return undef unless $url =~ m{^([A-Za-z][A-Za-z0-9+.\-]*)://([^/?\#]+)(.*)$};
+
+    my ($scheme, $authority, $rest) = (lc($1), $2, $3);
+    return undef if $authority =~ /\@/;
+
+    my ($host, $port);
+    if ($authority =~ /^\[([0-9A-Fa-f:.]+)\](?::(\d+))?$/) {
+        ($host, $port) = ($1, $2);
+    } elsif ($authority =~ /^([A-Za-z0-9._\-]+)(?::(\d+))?$/) {
+        ($host, $port) = ($1, $2);
+    } else {
+        return undef;
+    }
+
+    return undef if defined $port && ($port < 1 || $port > 65535);
+    $port = ($scheme eq 'https' ? 443 : 80) unless defined $port;
+    $rest = '/' unless length $rest;
+
+    return {
+        scheme => $scheme,
+        host   => $host,
+        port   => $port,
+        path   => $rest,
+        url    => $url,
+    };
+}
+
+# Why an address may not be fetched from, or undef when it may be.
+sub address_is_forbidden {
+    my ($ip) = @_;
+    return 'it is not an address' unless defined $ip && length $ip;
+
+    # An IPv4-mapped address is an IPv4 address wearing a hat, and
+    # ::ffff:127.0.0.1 reaches loopback exactly as 127.0.0.1 does. Checking it
+    # against the IPv6 ranges alone would let it through.
+    $ip = $1 if $ip =~ /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i;
+
+    return "\"$ip\" is not an address" unless HGConfig->valid_ip($ip);
+
+    my $v6 = ($ip =~ /:/) ? 1 : 0;
+    for my $range (@FORBIDDEN_RANGES) {
+        next if (($range =~ /:/) ? 1 : 0) != $v6;
+        return "$ip is inside $range, which is not on the public internet"
+            if HGConfig->ip_in_cidr($ip, $range);
+    }
+    return undef;
+}
+
+# Every address a host name answers with, as text.
+#
+# All of them, not the first: a name that answers with one public address and
+# one private one is exactly the shape of a rebinding attack, and taking the
+# first would let it through half the time. The caller refuses the fetch if
+# any single answer is forbidden.
+#
+# Returns (\@addresses, undef) or (undef, reason).
+sub resolve_host {
+    my ($host) = @_;
+    return (undef, 'no host to resolve') unless defined $host && length $host;
+
+    # A literal address is its own answer, and asking the resolver about it
+    # would only invite one.
+    return ([$host], undef) if HGConfig->valid_ip($host) && $host !~ m{/};
+
+    my @addrs;
+
+    if (defined &Socket::getaddrinfo) {
+        my ($err, @res) = Socket::getaddrinfo($host, '',
+                                              { socktype => Socket::SOCK_STREAM() });
+        return (undef, "cannot resolve $host: $err") if $err;
+        for my $ai (@res) {
+            my $text = _sockaddr_text($ai->{family}, $ai->{addr});
+            next unless defined $text;
+            push @addrs, $text unless grep { $_ eq $text } @addrs;
+        }
+    } else {
+        # A perl too old for Socket::getaddrinfo. IPv4 only, which is all
+        # gethostbyname can say - and a name that has to be reached over IPv6
+        # simply will not resolve here rather than being reached unchecked.
+        my @packed = (gethostbyname($host))[4 .. 8];
+        for my $p (@packed) {
+            next unless defined $p && length($p) == 4;
+            my $text = Socket::inet_ntoa($p);
+            push @addrs, $text unless grep { $_ eq $text } @addrs;
+        }
+    }
+
+    return (undef, "$host did not resolve to any address") unless @addrs;
+    return (\@addrs, undef);
+}
+
+# One resolved socket address as text, or undef for a family we do not fetch
+# over.
+sub _sockaddr_text {
+    my ($family, $addr) = @_;
+    return undef unless defined $family && defined $addr;
+
+    return eval {
+        if ($family == Socket::AF_INET()) {
+            my (undef, $packed) = Socket::unpack_sockaddr_in($addr);
+            return Socket::inet_ntoa($packed);
+        }
+        if (defined &Socket::AF_INET6 && $family == Socket::AF_INET6()) {
+            my (undef, $packed) = Socket::unpack_sockaddr_in6($addr);
+            return Socket::inet_ntop(Socket::AF_INET6(), $packed);
+        }
+        return undef;
+    };
+}
+
+# Decide whether one URL may be fetched, and where it resolves to.
+#
+# Returns (\%target, undef) with the resolved addresses filled in, or
+# (undef, reason). Called once per hop, so a redirect is judged by the same
+# rules as the URL an administrator configured.
+sub check_download_target {
+    my ($url, $allow_http) = @_;
+
+    my $target = split_url($url);
+    return (undef, "\"$url\" is not a usable http:// or https:// address")
+        unless $target;
+
+    unless ($target->{scheme} eq 'http' || $target->{scheme} eq 'https') {
+        return (undef, "$target->{scheme}:// is not a scheme this fetches over");
+    }
+
+    if ($target->{scheme} eq 'http' && !$allow_http) {
+        return (undef, "it is a plain http:// address, so anyone on the path "
+                     . "between here and the provider decides what the "
+                     . "firewall blocks. Use the https:// address the provider "
+                     . "publishes, or set BLOCKLIST_ALLOW_HTTP to 1 to accept "
+                     . "that risk deliberately");
+    }
+
+    my ($addrs, $err) = resolve_host($target->{host});
+    return (undef, $err) unless $addrs;
+
+    for my $addr (@$addrs) {
+        if (my $why = address_is_forbidden($addr)) {
+            return (undef, "$target->{host} resolves to $addr, which is not "
+                         . "somewhere a block list can be fetched from: $why");
+        }
+    }
+
+    $target->{addrs} = $addrs;
+    return ($target, undef);
+}
+
 # Fetch a URL to a file, refusing to write more than max_size bytes.
 #
 # The size cap is applied here rather than left to the downloader, because
@@ -629,75 +867,149 @@ sub run_command {
 # which is what stops a hostile or broken URL from filling the disk that the
 # firewall's own state lives on.
 #
+# Options: allow_http accepts a plain http:// source, and defaults off.
+#
 # Returns (rc, message) as run_command does: rc 0 on success.
 sub download_capped {
-    my ($url, $dest, $timeout, $max_size) = @_;
+    my ($url, $dest, $timeout, $max_size, %opt) = @_;
 
     $timeout  = 60       unless defined $timeout  && $timeout  =~ /^\d+$/ && $timeout > 0;
     $max_size = 20971520 unless defined $max_size && $max_size =~ /^\d+$/ && $max_size > 0;
 
+    my $current = $url;
+    my $hops    = 0;
+
+    while (1) {
+        my ($target, $why) = check_download_target($current, $opt{allow_http});
+        unless ($target) {
+            unlink($dest);
+            return (-1, ($hops ? "refused to follow a redirect to $current: "
+                               : "refused to fetch $current: ") . $why);
+        }
+
+        my ($rc, $msg, $location) = _fetch_once($target, $dest, $timeout, $max_size);
+        return ($rc, $msg) if $rc;
+        return (0, '') unless defined $location;
+
+        # The body of a redirect is not the list, whatever it contains.
+        unlink($dest);
+
+        if (++$hops > $MAX_REDIRECTS) {
+            return (-1, "the source redirected more than $MAX_REDIRECTS times");
+        }
+
+        my $next = _absolute_url($target, $location);
+        unless (defined $next) {
+            return (-1, "the source redirected to something that is not a "
+                      . "usable address: $location");
+        }
+        $current = $next;
+    }
+}
+
+# Resolve a Location header against the URL it came from.
+#
+# Returns undef for anything that cannot be made into an absolute URL, which
+# the caller reports rather than guessing at.
+sub _absolute_url {
+    my ($target, $location) = @_;
+    return undef unless defined $location && length $location;
+    return undef if $location =~ /[\s[:cntrl:]]/;
+
+    return $location if $location =~ m{^[A-Za-z][A-Za-z0-9+.\-]*://};
+
+    my $authority = ($target->{host} =~ /:/) ? "[$target->{host}]"
+                                             : $target->{host};
+    my $default = $target->{scheme} eq 'https' ? 443 : 80;
+    $authority .= ":$target->{port}" if $target->{port} != $default;
+
+    # Scheme-relative, before the path-absolute test below: "//host/x" starts
+    # with a slash and is not a path.
+    return "$target->{scheme}:$location" if $location =~ m{^//};
+    return "$target->{scheme}://$authority$location" if $location =~ m{^/};
+
+    my $dir = $target->{path};
+    $dir =~ s/[?\#].*$//;
+    $dir =~ s{[^/]*$}{};
+    $dir = '/' unless length $dir;
+    return "$target->{scheme}://$authority$dir$location";
+}
+
+# One hop: fetch a checked target, streaming it to $dest under the size cap.
+#
+# Returns (rc, message, location). A defined location means the server
+# answered with a redirect and the caller decides whether to follow it; $dest
+# then holds whatever body came with the redirect and is the caller's to
+# discard.
+sub _fetch_once {
+    my ($target, $dest, $timeout, $max_size) = @_;
+
+    my $url = $target->{url};
+
     # Both downloaders are asked to write to stdout so the bytes pass through
     # this process on their way to disk.
-    my @cmd;
+    my (@cmd, $hdrfile);
     if (my $curl = find_bin('curl')) {
+        $hdrfile = "$dest.hdr.$$";
+
+        # Pinned to the addresses check_download_target accepted. Without this
+        # the name is resolved a second time inside curl, and the answer to
+        # that lookup is not the answer that was checked - which is the whole
+        # of a rebinding attack. Skipped when the host is already a literal
+        # address, where there is no lookup to pin.
+        my @pin;
+        unless (HGConfig->valid_ip($target->{host})) {
+            for my $addr (@{ $target->{addrs} || [] }) {
+                my $text = ($addr =~ /:/) ? "[$addr]" : $addr;
+                push @pin, '--resolve', "$target->{host}:$target->{port}:$text";
+            }
+        }
+
         @cmd = ($curl,
                 '--fail',            # an HTTP error is a failure, not a body
                 '--silent', '--show-error',
-                '--location',        # follow provider redirects
-                # ...but only to where a block list can legitimately live. A
-                # provider that has been compromised, or simply taken over,
-                # can answer with a redirect, and an unrestricted --location
-                # follows it anywhere: cloud metadata on 169.254.169.254, a
-                # service listening on loopback, or file:// on a curl built
-                # with it. Nothing of the response comes back to the attacker
-                # - it is validated address by address and discarded - but the
-                # request is still made, as root, from inside the host.
-                '--proto', '=http,https',
-                '--proto-redir', '=http,https',
-                '--max-redirs', '3',
+                # An https source is fetched over https or not at all. An
+                # http one has already been accepted deliberately by the
+                # caller, and may still be answered by an https address.
+                '--proto', ($target->{scheme} eq 'https' ? '=https' : '=http,https'),
+                # Redirects are followed by download_capped, one hop at a
+                # time, so that each destination goes through the address
+                # check. curl following them itself would skip every check
+                # after the first.
+                '--max-redirs', '0',
+                @pin,
+                '--dump-header', $hdrfile,
                 '--max-time', $timeout,
                 '--max-filesize', $max_size,   # early abort when it can be known
                 '--output', '-',
                 $url);
     } elsif (my $wget = find_bin('wget')) {
-        # The same confinement curl gets, as far as wget can express it.
-        #
-        # It had none of it: only --max-redirect. curl is told which schemes it
-        # may use and which it may be redirected to, and the reasoning above
-        # applies word for word to wget - a provider that has been compromised
-        # answers with a redirect, and an unrestricted follow goes wherever it
-        # is pointed. Cloud metadata on 169.254.169.254 and anything listening
-        # on loopback are both plain HTTP, and both were reachable here as root
-        # from inside the host.
-        #
-        # --https-only is what closes that for an https source: wget then
-        # refuses to be redirected to http at all, and every list and zone file
-        # this software ships is https. It is applied per URL rather than
-        # unconditionally, because an operator who configured an http:// source
-        # has already chosen plaintext and refusing it here would break a
-        # working configuration to make a point.
-        my @https = ($url =~ m{^https://}i) ? ('--https-only') : ();
+        # wget is the fallback, and a weaker one than it looks. It has no
+        # --resolve, so a checked address cannot be pinned and the name is
+        # looked up again inside it; no --proto; and no option that bounds a
+        # transfer in total, which is why the size cap is enforced in this
+        # process. Redirects are refused outright rather than followed,
+        # because without pinning there is nothing to stop the second lookup
+        # answering with an address the first did not.
+        my @https = ($target->{scheme} eq 'https') ? ('--https-only') : ();
 
         @cmd = ($wget,
                 '--quiet',
                 '--timeout=' . $timeout,
-                '--max-redirect=3',
+                '--max-redirect=0',
                 '--tries=2',
                 @https,
                 '--output-document=-',
                 $url);
 
-        # wget is the fallback, and it is a weaker one than it looks. Besides
-        # the redirect confinement above it has no equivalent of --proto, and
-        # no option that bounds a transfer in total - which is why the size cap
-        # is enforced in this process rather than by the downloader. Said once,
-        # here, so the difference is on the record.
         HGLogger->log_warn("Downloading with wget; curl was not found. wget "
-                         . "cannot restrict which protocols a redirect may "
-                         . "use, so a compromised provider has more room here "
-                         . "than it would with curl. Installing curl is "
-                         . "worth doing on a host that fetches block lists.")
-            unless $url =~ m{^https://}i;
+                         . "cannot be pinned to the address this checked, and "
+                         . "cannot be told which protocols to use, so a "
+                         . "compromised or hijacked provider has more room "
+                         . "here than it would with curl, and a source that "
+                         . "answers with a redirect will simply fail. "
+                         . "Installing curl is worth doing on a host that "
+                         . "fetches block lists.");
     } else {
         return (-1, 'neither curl nor wget is installed');
     }
@@ -727,6 +1039,7 @@ sub download_capped {
     # can escalate.
     my ($rd, $wr);
     unless (pipe($rd, $wr)) {
+        unlink($hdrfile) if defined $hdrfile;
         return (-1, "pipe failed: $!");
     }
 
@@ -740,6 +1053,7 @@ sub download_capped {
     unless (defined $pid) {
         close($rd);
         close($wr);
+        unlink($hdrfile) if defined $hdrfile;
         return (-1, "fork failed: $!");
     }
     if ($pid == 0) {
@@ -770,6 +1084,7 @@ sub download_capped {
         close($rd);
         _reap_child($pid, 0);
         unlink($errfile);
+        unlink($hdrfile) if defined $hdrfile;
         return (-1, $error);
     }
     binmode($out);
@@ -835,6 +1150,12 @@ sub download_capped {
     unlink($errfile);
     $stderr =~ s/\s+$//;
 
+    my ($http_status, $location);
+    if (defined $hdrfile) {
+        ($http_status, $location) = _read_headers($hdrfile);
+        unlink($hdrfile);
+    }
+
     if ($over) {
         unlink($dest);
         return (-1, "download exceeded BLOCKLIST_MAX_SIZE ($max_size bytes) "
@@ -849,12 +1170,47 @@ sub download_capped {
         unlink($dest);
         return ($rc, length $stderr ? $stderr : "downloader exited with $rc");
     }
+
+    # A redirect is not a failure and not content. Reported up, where the
+    # destination can be checked before it is followed. Tested before the
+    # empty-body check below, because a redirect usually carries no body.
+    if (defined $http_status && $http_status >= 300 && $http_status < 400) {
+        return (0, '', $location) if defined $location;
+        unlink($dest);
+        return (-1, "the source answered with HTTP $http_status and no "
+                  . "destination to follow");
+    }
+
     unless ($written) {
         unlink($dest);
         return (-1, 'download was empty');
     }
 
     return (0, '');
+}
+
+# The final status and Location from a dumped header file.
+#
+# curl appends the headers of every response it saw, so the file can hold more
+# than one; the status resets the location so that a Location left behind by an
+# earlier response is never read as belonging to the last one.
+sub _read_headers {
+    my ($file) = @_;
+    my ($status, $location);
+
+    open(my $fh, '<', $file) or return (undef, undef);
+    while (my $line = <$fh>) {
+        $line =~ s/\r?\n\z//;
+        if ($line =~ m{^HTTP/\S+\s+(\d{3})}) {
+            $status   = $1;
+            $location = undef;
+            next;
+        }
+        $location = $1 if $line =~ /^Location:\s*(\S+)\s*$/i;
+    }
+    close($fh);
+
+    return ($status, $location);
 }
 
 # Collect a child process, escalating rather than waiting indefinitely.

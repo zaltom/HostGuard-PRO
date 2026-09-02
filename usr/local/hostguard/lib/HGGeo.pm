@@ -342,7 +342,11 @@ sub refresh {
     my $target = $class->cache_file($cc, $family);
     my $tmp    = "$target.tmp.$$";
 
-    my ($rc, $out) = _download($url, $tmp, $timeout, $max_size);
+    my $allow_http = (defined $config->{BLOCKLIST_ALLOW_HTTP}
+                      && $config->{BLOCKLIST_ALLOW_HTTP} =~ /^(1|yes|true|on)$/i)
+                   ? 1 : 0;
+
+    my ($rc, $out) = _download($url, $tmp, $timeout, $max_size, $allow_http);
     if ($rc) {
         unlink($tmp);
         # IPv6 zone files are not published for every country. A missing one is
@@ -525,10 +529,16 @@ sub count {
 # Fetch a list to a file, bounded by BLOCKLIST_MAX_SIZE.
 #
 # The cap is enforced by the shared downloader rather than by curl or
-# wget, neither of which can be relied on to bound a single transfer.
+# wget, neither of which can be relied on to bound a single transfer. So is
+# where the request is allowed to go, and whether a plain http:// source is
+# acceptable at all: see the Downloading section of HGConfig. GEO_SOURCE is
+# judged by the same BLOCKLIST_ALLOW_HTTP setting as a block list, because it
+# is the same kind of data, arriving over the same transport, deciding the
+# same thing.
 sub _download {
-    my ($url, $dest, $timeout, $max_size) = @_;
-    return HGConfig::download_capped($url, $dest, $timeout, $max_size);
+    my ($url, $dest, $timeout, $max_size, $allow_http) = @_;
+    return HGConfig::download_capped($url, $dest, $timeout, $max_size,
+                                     allow_http => $allow_http);
 }
 
 1;

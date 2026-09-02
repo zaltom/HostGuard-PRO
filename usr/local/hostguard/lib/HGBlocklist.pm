@@ -109,9 +109,15 @@ sub load {
             HGLogger->error("Blocklist $name has a non-numeric maximum: $max");
             next;
         }
-        # Only plain HTTP(S) URLs are fetched. Anything else - a local path, a
+        # Only HTTP(S) URLs are fetched. Anything else - a local path, a
         # different scheme, or an address carrying whitespace or control
-        # characters - is refused.
+        # characters - is refused here.
+        #
+        # Where an accepted URL may actually lead is decided at fetch time,
+        # not here: the host is resolved and checked, redirects are followed
+        # one hop at a time under the same check, and a plain http:// source
+        # needs BLOCKLIST_ALLOW_HTTP. See the Downloading section of HGConfig.
+        # That check needs the configuration, which this does not have.
         unless ($url =~ m{^https?://[^\s[:cntrl:]]+$}i) {
             HGLogger->error("Blocklist $name has an unsupported URL: $url");
             next;
@@ -157,6 +163,22 @@ sub is_due {
     return $age >= $entry->{interval} ? 1 : 0;
 }
 
+# Whether a plain http:// source may be fetched.
+#
+# Off unless BLOCKLIST_ALLOW_HTTP says otherwise. Over plain HTTP the reply is
+# written by whoever is on the path between here and the provider, and the
+# reply is what the firewall drops - so somebody in that position can empty a
+# list, or fill one with the addresses of the customers this host serves, and
+# every check downstream of the download would find nothing wrong with what
+# arrived. Every list this software ships a line for is published over https,
+# so the setting is for an operator with an internal mirror that genuinely has
+# no certificate, and not for convenience.
+sub allow_http {
+    my ($config) = @_;
+    my $value = $config ? $config->get('BLOCKLIST_ALLOW_HTTP') : undef;
+    return (defined $value && $value =~ /^(1|yes|true|on)$/i) ? 1 : 0;
+}
+
 # Fetch one list and replace its cached copy.
 #
 # The download lands in a temporary file and has to be accepted before it is
@@ -184,7 +206,8 @@ sub refresh {
     my $target = $class->cache_file($entry->{name});
     my $tmp    = "$target.tmp.$$";
 
-    my ($rc, $out) = _download($entry->{url}, $tmp, $timeout, $max_size);
+    my ($rc, $out) = _download($entry->{url}, $tmp, $timeout, $max_size,
+                               allow_http($config));
     if ($rc) {
         unlink($tmp);
         HGLogger->error("Blocklist $entry->{name} download failed (rc=$rc): $out");
@@ -227,10 +250,13 @@ sub refresh_due {
 # Fetch a list to a file, bounded by BLOCKLIST_MAX_SIZE.
 #
 # The cap is enforced by the shared downloader rather than by curl or
-# wget, neither of which can be relied on to bound a single transfer.
+# wget, neither of which can be relied on to bound a single transfer. So is
+# where the request is allowed to go, and whether a plain http:// source is
+# acceptable at all: see the Downloading section of HGConfig.
 sub _download {
-    my ($url, $dest, $timeout, $max_size) = @_;
-    return HGConfig::download_capped($url, $dest, $timeout, $max_size);
+    my ($url, $dest, $timeout, $max_size, $allow_http) = @_;
+    return HGConfig::download_capped($url, $dest, $timeout, $max_size,
+                                     allow_http => $allow_http);
 }
 
 ###############################################################################
