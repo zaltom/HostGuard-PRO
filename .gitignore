@@ -16,7 +16,3 @@ var/log/hostguard/*
 Thumbs.db
 .idea/
 .vscode/
-
-# Local regression suite. Kept out of the repository deliberately: it is a
-# development aid, not part of what gets installed on a host.
-t/

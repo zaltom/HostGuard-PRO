@@ -264,10 +264,6 @@ sub key_status {
 }
 
 # Decide whether a key is usable, given what was found on disk.
-#
-# Separated from reading the file so the decision can be exercised directly.
-# The states it distinguishes are the whole of the policy, and a policy that
-# cannot be tested is one that quietly stops being enforced.
 sub classify_key {
     my ($file, $mode, $uid, $key) = @_;
 
