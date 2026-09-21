@@ -596,6 +596,29 @@ if ! grep -q '^GEO_ENABLE' /etc/hostguard/hostguard.conf 2>/dev/null; then
     log_warn "New features are off by default; see hostguard.conf.dist for them."
 fi
 
+# Two defaults are stricter than they were, and a host relying on the old
+# behaviour would otherwise find out by having a feature quietly stop. Named
+# individually, because "new settings default off" reads as harmless and these
+# two turn off something that was working.
+if grep -qE '^(PRE_SCRIPT|POST_SCRIPT|BLOCK_REPORT)[[:space:]]*=[[:space:]]*"[^"]' \
+        /etc/hostguard/hostguard.conf 2>/dev/null \
+   && ! grep -q '^HOOKS_ENABLE' /etc/hostguard/hostguard.conf 2>/dev/null; then
+    log_warn "This host names a hook script, and hooks are now off unless"
+    log_warn "HOOKS_ENABLE is 1. A setting that runs a program as root is"
+    log_warn "opt-in from this version. Add to hostguard.conf to keep it:"
+    log_warn "  HOOKS_ENABLE = \"1\""
+fi
+
+if grep -q '^CLUSTER_ENABLE[[:space:]]*=[[:space:]]*"1"' \
+        /etc/hostguard/hostguard.conf 2>/dev/null \
+   && ! grep -q '^CLUSTER_ACCEPT_ACTIONS' /etc/hostguard/hostguard.conf 2>/dev/null; then
+    log_warn "Cluster members no longer accept ALLOW by default: it appends to"
+    log_warn "allow.conf permanently, and one compromised member could allowlist"
+    log_warn "an attacker across the whole group. If this cluster propagates"
+    log_warn "allowlist entries deliberately, add to hostguard.conf:"
+    log_warn "  CLUSTER_ACCEPT_ACTIONS = \"DENY,TEMPDENY,UNBLOCK,ALLOW,PING\""
+fi
+
 # Set strict permissions on config files
 # The daemon's unit makes deny.conf and allow.conf writable individually
 # rather than the whole of /etc/hostguard, and systemd cannot bind-mount a

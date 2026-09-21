@@ -1294,6 +1294,10 @@ sub find_bin {
 # Quiet by default: find_bin walks candidates and a rejection there is a reason
 # to try the next directory, not an error. Pass a label to have the reason
 # logged, which is what a configured path wants.
+# How many symlinks a path may pass through before it is refused. A deployment
+# link or two is ordinary; a chain longer than this is a loop or a mistake.
+our $MAX_LINK_HOPS = 8;
+
 sub safe_to_exec {
     my ($path, $label) = @_;
     return 0 unless defined $path && length $path;
@@ -1310,20 +1314,179 @@ sub safe_to_exec {
     return $complain->(sprintf('mode %04o is writable by group or other',
                                $st[2] & 07777))        if $st[2] & 022;
 
-    my $dir = $path;
-    while ($dir =~ s{/[^/]+$}{}) {
-        $dir = '/' unless length $dir;
-        my @d = stat($dir);
-        return $complain->("cannot stat the directory $dir: $!") unless @d;
-        return $complain->(sprintf('the directory %s is owned by uid %d with '
-                                 . 'mode %04o, so it is not only root who '
-                                 . 'decides what is there',
-                                   $dir, $d[4], $d[2] & 07777))
-            if $d[4] != 0 || ($d[2] & 022);
-        last if $dir eq '/';
+    # Every name the path passes through on its way to that file.
+    #
+    # stat follows symlinks, so the checks above already describe the target
+    # rather than the link - but the directory walk below does not follow
+    # anything, and walking only the link's own parents is the hole. A root
+    # owned, mode 0755 script in /home/alice, reached through a link at
+    # /usr/local/sbin/hg-hook, passes every test above: the target is root's
+    # and nobody else can write the file. Alice can still delete it and put
+    # her own there, because the directory is hers, and the walk over
+    # /usr/local/sbin never looks at /home/alice.
+    #
+    # Resolved one link at a time, and not with realpath, which collapses a
+    # chain to its final target in a single step. That is the same hole one
+    # hop further in: with
+    #
+    #   /usr/local/sbin/hg-hook -> /home/alice/link -> /root/actual
+    #
+    # realpath answers /root/actual, both ends are root's, both walks pass,
+    # and /home/alice is never looked at - so alice repoints the middle link
+    # and root runs her program on the next reload. Every name in the chain
+    # has to be checked, because every one of them is a place the kernel will
+    # look again when it execs.
+    #
+    # A symlink is a perfectly ordinary way to deploy a hook, and this does not
+    # refuse one; it insists that every name it passes through is as tightly
+    # held as the one that was configured.
+    my @chains;
+    my $real  = $path;
+    my $hops  = 0;
+    while (1) {
+        # A '..' after a link has been followed would make the directory walk
+        # below - which is textual - walk the wrong directories. Refused
+        # rather than normalised: a hook reachable only through '..' is a hook
+        # nobody can read the path of and be sure where it goes.
+        return $complain->("its path passes through '$real', which contains "
+                         . "'..'")
+            if $real =~ m{(?:^|/)\.\.(?:/|$)};
+
+        push @chains, $real;
+
+        my @l = lstat($real);
+        return $complain->("cannot stat $real: $!") unless @l;
+        last unless -l _;
+
+        return $complain->("it passes through more than $MAX_LINK_HOPS "
+                         . 'symlinks')
+            if ++$hops > $MAX_LINK_HOPS;
+
+        my $target = readlink($real);
+        return $complain->("cannot read the symlink $real: $!")
+            unless defined $target && length $target;
+
+        # A relative target is relative to the directory the link is in.
+        unless ($target =~ m{^/}) {
+            my $dir = $real;
+            $dir =~ s{/[^/]+$}{};
+            $dir = '' unless length $dir;
+            $target = "$dir/$target";
+        }
+        $real = $target;
+    }
+
+    if ($real ne $path) {
+        my @rst = stat($real);
+        return $complain->("cannot stat $real, which it resolves to: $!")
+            unless @rst;
+        return $complain->("$real, which it resolves to, is not an executable "
+                         . 'regular file')             unless -f _ && -x _;
+        return $complain->("$real, which it resolves to, is not owned by root")
+            if $rst[4] != 0;
+        return $complain->(sprintf('%s, which it resolves to, is mode %04o '
+                                 . 'and so writable by group or other',
+                                   $real, $rst[2] & 07777))
+            if $rst[2] & 022;
+    }
+
+    for my $start (@chains) {
+        my $dir = $start;
+        while ($dir =~ s{/[^/]+$}{}) {
+            $dir = '/' unless length $dir;
+            my @d = stat($dir);
+            return $complain->("cannot stat the directory $dir: $!") unless @d;
+            return $complain->(sprintf('the directory %s is owned by uid %d '
+                                     . 'with mode %04o, so it is not only '
+                                     . 'root who decides what is there',
+                                       $dir, $d[4], $d[2] & 07777))
+                if $d[4] != 0 || ($d[2] & 022);
+            last if $dir eq '/';
+        }
     }
 
     return 1;
+}
+
+###############################################################################
+# Settings the browser may not change
+###############################################################################
+#
+# The WHM plugin's configuration editor replaces hostguard.conf wholesale from
+# a textarea. That is what a configuration editor is, and RESTRICT_UI already
+# turns the whole thing off - but "on" and "off" are the only two positions it
+# has, and an operator who wants to adjust a block duration from the browser
+# has to accept every other setting being adjustable from there too.
+#
+# Some of them are not the same kind of setting. These name a program to run as
+# root, decide whether downloaded data is authenticated at all, or switch the
+# firewall off on a timer. A WHM session that has been left open, an XSS in
+# another plugin, a support engineer with a broader remit than intended: none
+# of those should be one form submission away from arbitrary root execution,
+# and none of them has any business turning off list verification.
+#
+# So they are settled at the shell, by somebody on the host, and the editor
+# refuses a save that changes one. It is not a defence against root - anyone
+# with a shell can edit the file and this list with it. It narrows what an
+# authenticated browser session is worth, which is the thing that was too wide.
+our @PROTECTED_KEYS = qw(
+    HOOKS_ENABLE
+    PRE_SCRIPT
+    POST_SCRIPT
+    BLOCK_REPORT
+    IPTABLES
+    IP6TABLES
+    IPSET
+    TESTING
+    RESTRICT_UI
+    CLUSTER_KEY_FILE
+    BLOCKLIST_ALLOW_HTTP
+    BLOCKLIST_REQUIRE_VERIFY
+    BLOCKLIST_GPG_KEYRING
+);
+
+sub protected_keys { return @PROTECTED_KEYS }
+
+# Which protected settings a proposed hostguard.conf would change.
+#
+# Compares the text against the values in force, and reports a key when it is
+# added, removed or altered. Returns a list of key names, empty when the save
+# leaves all of them alone.
+#
+# The text is parsed with loadconfig's own rules rather than a looser regex, so
+# that what this compares is what the file would actually mean.
+sub protected_changes {
+    my ($class, $text, $current) = @_;
+
+    my %proposed;
+    for my $line (split(/\n/, defined $text ? $text : '')) {
+        $line =~ s/\s*#.*$// unless $line =~ /^#/;
+        next if $line =~ /^\s*#/ || $line =~ /^\s*$/;
+
+        my ($key, $value);
+        if    ($line =~ /^\s*(\w+)\s*=\s*"([^"]*)"\s*$/) { ($key, $value) = ($1, $2) }
+        elsif ($line =~ /^\s*(\w+)\s*=\s*'([^']*)'\s*$/) { ($key, $value) = ($1, $2) }
+        elsif ($line =~ /^\s*(\w+)\s*=\s*(\S+)\s*$/)     { ($key, $value) = ($1, $2) }
+        next unless defined $key;
+
+        # loadconfig lets the last occurrence win, so this must too.
+        $proposed{$key} = $value;
+    }
+
+    my @changed;
+    for my $key (@PROTECTED_KEYS) {
+        my $was = ref($current) eq 'HASH' ? $current->{$key}
+                : (defined $current ? $current->get($key) : undef);
+        my $now = $proposed{$key};
+
+        # A key absent from both, or present in both with the same value, is
+        # unchanged. Absent on one side only is a change: removing a line and
+        # letting a default take over is still deciding what the setting is.
+        next if !defined $was && !defined $now;
+        push @changed, $key if !defined $was || !defined $now || $was ne $now;
+    }
+
+    return @changed;
 }
 
 # Get lock for exclusive operations

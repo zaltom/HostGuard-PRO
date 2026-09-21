@@ -481,7 +481,7 @@ sub main {
         my $path = $config{$key};
         next unless defined $path && length $path;
         HGLogger->info("$key is set to $path")
-            if HGFirewall->safe_hook($path, $key);
+            if HGFirewall->safe_hook($path, $key, \%config);
     }
 
     HGLogger->info("HostGuard Pro daemon started (PID $$)");

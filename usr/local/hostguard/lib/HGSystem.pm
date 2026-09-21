@@ -274,7 +274,11 @@ sub security_check {
 
     # --- File permissions --------------------------------------------------
 
-    for my $path ('/etc/hostguard/hostguard.conf', '/etc/hostguard/cluster.key') {
+    # Files whose contents are secret or are firewall policy. cluster.conf is
+    # in the list because a member may carry its own key there, so the file
+    # holds secrets as well as addresses.
+    for my $path ('/etc/hostguard/hostguard.conf', '/etc/hostguard/cluster.key',
+                  '/etc/hostguard/cluster.conf') {
         next unless -f $path;
         my @st = stat($path);
         next unless @st;
@@ -283,6 +287,89 @@ sub security_check {
                sprintf('Mode is %04o; it should be 0600.', $mode),
                $path)
             if $mode & 0077;
+    }
+
+    # The directories and programs the firewall is made of.
+    #
+    # Almost everything else on this page is a setting somebody chose. This is
+    # the ground all of those stand on: the software reads its policy from
+    # /etc/hostguard and runs code from /usr/local/hostguard as root, so an
+    # account that can write into either decides what the firewall does,
+    # whatever the settings say. That is not usually a decision anybody made -
+    # it is an installer run from an odd umask, a directory restored from a
+    # backup with its ownership flattened, a package that was unpacked as the
+    # wrong user. Nothing else would notice, so this does.
+    for my $path ('/etc/hostguard', '/var/lib/hostguard',
+                  '/usr/local/hostguard', '/usr/local/hostguard/lib',
+                  '/usr/local/hostguard/bin') {
+        next unless -e $path;
+        my @st = stat($path);
+        next unless @st;
+        my $mode = $st[2] & 07777;
+
+        if ($st[4] != 0) {
+            my $owner = getpwuid($st[4]);
+            $owner = defined $owner ? $owner : $st[4];
+            $add->('high', "$path is not owned by root",
+                   "It is owned by $owner, so that account can change what the "
+                 . 'firewall reads or runs.',
+                   $path);
+        }
+        $add->('high', "$path can be written by other users",
+               sprintf('Mode is %04o. Anyone in that set can change what the '
+                     . 'firewall reads or runs.', $mode),
+               $path)
+            if $mode & 022;
+    }
+
+    # --- Hooks -------------------------------------------------------------
+
+    my @hooks = grep { defined $config->{$_} && length $config->{$_} }
+                qw(PRE_SCRIPT POST_SCRIPT BLOCK_REPORT);
+
+    my $hooks_on = (($config->{HOOKS_ENABLE} // '0') =~ /^(1|yes|true|on)$/i);
+
+    if ($hooks_on && @hooks) {
+        $add->('medium', 'Programs named in the configuration run as root',
+               'HOOKS_ENABLE is 1 and ' . join(', ', @hooks) . ' '
+             . (@hooks == 1 ? 'is' : 'are') . ' set, so those programs are run '
+             . 'as root by the firewall. Anything able to write hostguard.conf '
+             . 'can change what runs. Set HOOKS_ENABLE to 0 if the hooks are '
+             . 'no longer needed.',
+               '/etc/hostguard/hostguard.conf');
+
+        # The same test the firewall applies before running one, asked here so
+        # that a hook which has quietly become unrunnable is visible before the
+        # reload that silently skips it. Silent, because the firewall's own
+        # attempt reports it in full.
+        for my $key (@hooks) {
+            my $path = $config->{$key};
+            next if HGConfig::safe_to_exec($path, undef);
+            $add->('high', "$key names a program that will not be run",
+                   "$path is not a root-owned executable file in a directory "
+                 . 'only root can change, or it resolves to one that is not, so '
+                 . 'the firewall refuses to run it. Whatever the hook does is '
+                 . 'not happening.',
+                   '/etc/hostguard/hostguard.conf');
+        }
+    } elsif (!$hooks_on && @hooks) {
+        $add->('low', 'Hook settings are set but hooks are off',
+               join(', ', @hooks) . ' '
+             . (@hooks == 1 ? 'names a program' : 'name programs')
+             . ' that will not run, because HOOKS_ENABLE is 0. Either turn it '
+             . 'on deliberately or clear the setting, so the file says what is '
+             . 'actually happening.',
+               '/etc/hostguard/hostguard.conf');
+    }
+
+    # --- Downloaded data ---------------------------------------------------
+
+    if (($config->{BLOCKLIST_ALLOW_HTTP} // '0') =~ /^(1|yes|true|on)$/i) {
+        $add->('medium', 'Block lists may be fetched over plain HTTP',
+               'BLOCKLIST_ALLOW_HTTP is 1, so a list can be served over a '
+             . 'transport anyone on the path can rewrite. What they write is '
+             . 'what the firewall blocks.',
+               '/etc/hostguard/hostguard.conf');
     }
 
     for my $dir (@HGProcess::TEMP_DIRS) {

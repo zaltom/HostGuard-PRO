@@ -19,6 +19,9 @@ package HGFirewall;
 use strict;
 use warnings;
 use Fcntl qw(:DEFAULT :flock);
+# _exit for the hook child: it shares this process's buffers, and running the
+# parent's exit handlers from a failed exec would flush them twice.
+use POSIX qw(_exit);
 use HGConfig;
 use HGLogger;
 use HGBlocklist;
@@ -533,20 +536,118 @@ sub _exec_safe_file {
     return HGConfig::safe_to_exec($path, $label);
 }
 
+# One setting, from either shape of configuration.
+#
+# safe_hook is called from the firewall, which holds an HGConfig object, and
+# from the daemon, which holds a plain hash of the same file.
+sub _cfg {
+    my ($config, $key) = @_;
+    return undef unless defined $config;
+    return $config->get($key) if ref($config) && ref($config) ne 'HASH';
+    return $config->{$key}    if ref($config) eq 'HASH';
+    return undef;
+}
+
+# Whether hooks may run at all.
+#
+# Off unless HOOKS_ENABLE says otherwise, and off is the shipped default.
+#
+# The checks below are good ones and they are not the point. PRE_SCRIPT,
+# POST_SCRIPT and BLOCK_REPORT are three settings in a text file that name a
+# program this software runs as root, so anything that can write one line of
+# that file has root - and that is a larger surface than the file itself. It is
+# every path that ever writes it: a restored backup, a configuration-management
+# template, a support script, a WHM session, a future release that gives the
+# plugin a narrower ACL. A host that does not use hooks should not be one
+# config edit away from arbitrary root execution, and almost no host uses them.
+#
+# So the feature is opt-in. An operator who wants a hook turns it on once,
+# deliberately, in the same file - which does not help against somebody who
+# already has root, and does mean the setting is a thing a security check can
+# look at and a change a diff can show.
+sub hooks_enabled {
+    my ($config) = @_;
+    my $value = _cfg($config, 'HOOKS_ENABLE');
+    return (defined $value && $value =~ /^(1|yes|true|on)$/i) ? 1 : 0;
+}
+
 # A configured hook script, or the empty string if it is not safe to run.
 #
 # PRE_SCRIPT, POST_SCRIPT and BLOCK_REPORT run as root exactly as the firewall
 # binaries do; they are only allowed a wider choice of directory because a site
-# hook has nowhere obvious to live.
+# hook has nowhere obvious to live. The file checks are HGConfig::safe_to_exec,
+# which follows the path to what it actually resolves to.
 sub safe_hook {
-    my ($class, $path, $label) = @_;
+    my ($class, $path, $label, $config) = @_;
     return '' unless defined $path && length $path;
+
+    unless (hooks_enabled($config)) {
+        HGLogger->log_warn("Ignoring $label '$path': hooks are off. A setting "
+                         . "that names a program to run as root is opt-in; set "
+                         . "HOOKS_ENABLE to 1 in hostguard.conf if this hook "
+                         . "is meant to run.");
+        return '';
+    }
+
     unless ($path =~ m{^(?:/[\w.+-]+)+$}) {
         HGLogger->error("Ignoring $label '$path': it must be an absolute path, "
                       . "free of '..' and unusual characters");
         return '';
     }
     return _exec_safe_file($path, $label) ? $path : '';
+}
+
+# How long a hook may run before it is stopped. Overridden by HOOK_TIMEOUT.
+our $HOOK_TIMEOUT = 30;
+
+# Run a checked hook, bounded.
+#
+# system() waits for as long as the hook takes, and every caller here is on a
+# path that must not stop: two of them are inside a firewall rebuild holding
+# the firewall lock, and the third is on the daemon's main loop, where a wait
+# is also no log reading, no block expiry and no cluster listening. A hook that
+# blocks on a network call, a full disk or a prompt nobody answers is not
+# exotic - it is the ordinary failure of a script written for a shell - and it
+# stopped the firewall until somebody noticed.
+#
+# So it is given a deadline, then SIGTERM, then SIGKILL, reusing the same
+# bounded collection the downloader uses. The hook keeps this process's output
+# handles, as it had before.
+sub run_hook {
+    my ($class, $path, $label, $config, @args) = @_;
+    return 0 unless defined $path && length $path;
+
+    my $timeout = _cfg($config, 'HOOK_TIMEOUT');
+    $timeout = $HOOK_TIMEOUT
+        unless defined $timeout && $timeout =~ /^\d+$/ && $timeout > 0;
+
+    # The daemon sets SIGCHLD to IGNORE so its short-lived children are not
+    # left as zombies, which is also an instruction to discard the status this
+    # needs to collect.
+    local $SIG{CHLD} = 'DEFAULT';
+
+    my $pid = fork();
+    unless (defined $pid) {
+        HGLogger->error("Cannot run $label $path: fork failed: $!");
+        return 0;
+    }
+    if ($pid == 0) {
+        # The brace form, so that a hook named with a space in it is still one
+        # program and never a shell command line.
+        exec { $path } $path, @args or POSIX::_exit(127);
+    }
+
+    my ($reaped, $status) = HGConfig::_wait_child($pid, $timeout);
+    unless ($reaped) {
+        HGLogger->error("$label $path did not finish within ${timeout}s and is "
+                      . "being stopped; the firewall is not waiting for it");
+        HGConfig::_reap_child($pid, 0);
+        return 0;
+    }
+
+    my $rc = (defined $status && $status >= 0) ? ($status >> 8) : -1;
+    HGLogger->log_warn("$label $path exited with $rc") if $rc;
+    return $rc == 0 ? 1 : 0;
 }
 
 # Arguments that make iptables wait for the xtables lock, if it can.
@@ -611,10 +712,11 @@ sub start {
     HGLogger->info("Starting HostGuard Pro firewall...");
 
     # Run pre-script if configured
-    my $pre = HGFirewall->safe_hook($config->get('PRE_SCRIPT'), 'PRE_SCRIPT');
+    my $pre = HGFirewall->safe_hook($config->get('PRE_SCRIPT'), 'PRE_SCRIPT',
+                                    $config);
     if ($pre) {
         HGLogger->info("Running pre-script: $pre");
-        system { $pre } $pre;
+        HGFirewall->run_hook($pre, 'PRE_SCRIPT', $config);
     }
 
     _reset_blocklists();
@@ -772,10 +874,11 @@ sub start {
     _use_slot($new);
 
     # Run post-script if configured
-    my $post = HGFirewall->safe_hook($config->get('POST_SCRIPT'), 'POST_SCRIPT');
+    my $post = HGFirewall->safe_hook($config->get('POST_SCRIPT'), 'POST_SCRIPT',
+                                     $config);
     if ($post) {
         HGLogger->info("Running post-script: $post");
-        system { $post } $post;
+        HGFirewall->run_hook($post, 'POST_SCRIPT', $config);
     }
 
     # Record start time
@@ -3794,10 +3897,13 @@ sub _tempblock_locked {
     _flush_conntrack($ip, $config);
 
     # Call block report hook if configured
-    my $hook = HGFirewall->safe_hook($config->get('BLOCK_REPORT'), 'BLOCK_REPORT');
+    my $hook = HGFirewall->safe_hook($config->get('BLOCK_REPORT'), 'BLOCK_REPORT',
+                                     $config);
     if ($hook) {
-        # Sanitize arguments - only pass validated IP
-        system($hook, $ip, $reason, $duration);
+        # Only the validated address is passed, and it is passed as an
+        # argument rather than through a shell.
+        HGFirewall->run_hook($hook, 'BLOCK_REPORT', $config,
+                             $ip, $reason, $duration);
     }
 
     return 1;

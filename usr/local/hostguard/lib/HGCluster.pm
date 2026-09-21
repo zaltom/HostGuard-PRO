@@ -151,25 +151,100 @@ our %ACTIONS = (
     PING      => 'confirm the member is reachable',
 );
 
+# The actions this member is willing to act on when another member asks.
+#
+# Sending is not restricted by this; being told is. Every member of a cluster
+# trusts every other member completely - that is what a shared secret means -
+# so the question worth asking is not "can this message be authenticated" but
+# "what is the worst thing an authenticated message can do", and the answer was
+# not the same for all five.
+#
+# DENY, TEMPDENY and UNBLOCK move addresses in and out of the block lists,
+# which is the whole point of a cluster and is recoverable in one command.
+# ALLOW is different in kind: it appends to allow.conf, permanently, and an
+# allowlisted address bypasses every block on the host including the ones this
+# firewall would otherwise place itself. One compromised member could quietly
+# allowlist itself, or an attacker's range, across the entire group, and the
+# addition survives every reload and looks exactly like a deliberate one.
+#
+# So ALLOW is off unless CLUSTER_ACCEPT_ACTIONS names it. A cluster that
+# genuinely propagates allowlist entries sets it and knows it has.
+our @DEFAULT_ACCEPT = qw(DENY TEMPDENY UNBLOCK PING);
+
+sub accepted_actions {
+    my ($class, $config) = @_;
+
+    my $raw = $config ? $config->{CLUSTER_ACCEPT_ACTIONS} : undef;
+    my @names;
+    if (defined $raw && $raw =~ /\S/) {
+        for my $name (split(/,/, uc $raw)) {
+            $name =~ s/\s//g;
+            push @names, $name if length $name;
+        }
+    } else {
+        @names = @DEFAULT_ACCEPT;
+    }
+
+    my %accept;
+    for my $name (@names) {
+        unless (exists $ACTIONS{$name}) {
+            HGLogger->error("CLUSTER_ACCEPT_ACTIONS names an action that does "
+                          . "not exist: $name");
+            next;
+        }
+        $accept{$name} = 1;
+    }
+
+    # PING carries no instruction - it asks whether this host is listening -
+    # and a member that cannot be pinged looks broken to every diagnostic in
+    # the software. It is always accepted.
+    $accept{PING} = 1;
+
+    return \%accept;
+}
+
 ###############################################################################
 # Membership
 ###############################################################################
 
-# Read cluster.conf: one member address per line, optionally with a comment.
+# Read cluster.conf: one member per line, as an address and optional settings.
+#
+#   203.0.113.10
+#   203.0.113.11  key=9f0c...           # this member signs with its own key
 #
 # The local host's own addresses are not filtered out here. Sending to
 # ourselves is harmless - the message is authenticated and idempotent - and
 # filtering would need an address list this module has no reason to hold.
+#
+# Returns the addresses. member_keys returns the keys from the same file; the
+# two are separate so that every existing caller of members() keeps getting a
+# plain list of addresses.
 sub members {
     my ($class, $file) = @_;
+    my ($addrs) = _read_members($file);
+    return @$addrs;
+}
+
+# Address to key, for the members that name one. Members without a key are
+# absent from the hash and fall back to the shared secret.
+sub member_keys {
+    my ($class, $file) = @_;
+    my (undef, $keys) = _read_members($file);
+    return %$keys;
+}
+
+# One pass over cluster.conf, returning (\@addresses, \%keys_by_address).
+sub _read_members {
+    my ($file) = @_;
     $file //= "$HGConfig::CONFIG_DIR/cluster.conf";
 
     my @members;
-    return @members unless -f $file;
+    my %keys;
+    return (\@members, \%keys) unless -f $file;
 
     open(my $fh, '<', $file) or do {
         HGLogger->log_warn("Cannot open $file: $!");
-        return @members;
+        return (\@members, \%keys);
     };
 
     my %seen;
@@ -180,29 +255,85 @@ sub members {
         $line =~ s/\s*#.*$//;
         next unless length $line;
 
-        unless (HGConfig->valid_ip($line)) {
-            HGLogger->error("Ignoring cluster member that is not an address: $line");
+        # The address, then any number of name=value settings after it.
+        my ($addr, @rest) = split(/\s+/, $line);
+        next unless defined $addr && length $addr;
+
+        unless (HGConfig->valid_ip($addr)) {
+            HGLogger->error("Ignoring cluster member that is not an address: $addr");
             next;
         }
         # A CIDR range names many hosts and cannot be connected to.
-        if ($line =~ m{/}) {
-            HGLogger->error("Cluster members must be single addresses, not ranges: $line");
+        if ($addr =~ m{/}) {
+            HGLogger->error("Cluster members must be single addresses, not ranges: $addr");
             next;
         }
         # Refused here rather than at send time. An address accepted into the
         # list and then skipped on every broadcast is a member that appears
         # configured and silently never receives anything.
-        unless (defined _family($line)) {
-            HGLogger->error("Ignoring cluster member $line: this Perl's Socket "
+        unless (defined _family($addr)) {
+            HGLogger->error("Ignoring cluster member $addr: this Perl's Socket "
                           . "cannot do IPv6, so an IPv6 member cannot be reached");
             next;
         }
-        next if $seen{$line}++;
-        push @members, $line;
+        next if $seen{$addr}++;
+        push @members, $addr;
+
+        for my $attr (@rest) {
+            my ($name, $value) = split(/=/, $attr, 2);
+            $name = lc($name // '');
+            unless ($name eq 'key' && defined $value && length $value) {
+                HGLogger->error("Ignoring unknown setting on cluster member "
+                              . "$addr: $attr");
+                next;
+            }
+            # The same floor secret() applies to the shared key. A per-member
+            # key that can be searched is worse than no per-member key, because
+            # it looks like the tighter arrangement while being the weaker one.
+            if (length($value) < 16) {
+                HGLogger->error("Ignoring the key for cluster member $addr: it "
+                              . "is only " . length($value) . " characters. "
+                              . "Generate one with: openssl rand -hex 32");
+                next;
+            }
+            $keys{_packed($addr) // $addr} = $value;
+        }
     }
     close($fh);
 
-    return @members;
+    return (\@members, \%keys);
+}
+
+# The key one member's messages must be signed with.
+#
+# A per-member key in cluster.conf if there is one, and the shared secret
+# otherwise. There is no falling back from one to the other: a member given its
+# own key is authenticated by that key alone, or the entry could be removed and
+# the member would carry on being trusted through the shared secret, which is
+# the opposite of what naming a key per member is for.
+#
+# What this buys is revocation. One shared secret means one thing to lose and
+# nothing to lose it in isolation: a member that is compromised holds the key
+# every member uses, so recovering means generating a new secret and visiting
+# every host in the group before any of them can talk again. With a key per
+# member, the answer to a compromised member is to delete its line.
+#
+# What it does not buy is protection from a member behaving badly while it is
+# still trusted. A compromised member holding its own valid key can still ask
+# every peer to block an address, which is what CLUSTER_ACCEPT_ACTIONS and the
+# rate limit in accept_message are for.
+sub key_for_member {
+    my ($class, $peer, $config) = @_;
+
+    my %keys = $class->member_keys();
+    if (%keys) {
+        my $packed = _packed($peer);
+        my $key = defined $packed ? $keys{$packed} : undef;
+        $key = $keys{$peer} unless defined $key;
+        return $key if defined $key && length $key;
+    }
+
+    return $class->secret($config);
 }
 
 # True when the given address is a configured member.
@@ -494,6 +625,15 @@ sub parse {
 
     unless (exists $ACTIONS{$action}) {
         HGLogger->log_warn("Cluster message has an unsupported action: $action");
+        return undef;
+    }
+
+    # Authenticated, and still not necessarily permitted. See accepted_actions.
+    my $accept = $class->accepted_actions($config);
+    unless ($accept->{$action}) {
+        HGLogger->log_warn("Cluster message asks to $ACTIONS{$action}, which "
+                         . "this host does not accept from members. Add "
+                         . "$action to CLUSTER_ACCEPT_ACTIONS if it should.");
         return undef;
     }
 
@@ -873,6 +1013,11 @@ sub accept_message {
         return ();
     }
 
+    unless (_within_rate($peer, $config)) {
+        close($conn);
+        return ();
+    }
+
     # Bounded by the clock, on a non-blocking socket.
     #
     # This ran as a blocking sysread under alarm(5), on the daemon's main loop,
@@ -915,12 +1060,64 @@ sub accept_message {
 
     ($line) = split(/\n/, $line, 2);
 
-    my $key = $class->secret($config);
+    # Signed with this member's own key where it has one, so that a member
+    # whose key has been removed from cluster.conf stops being trusted without
+    # every other member having to be rekeyed.
+    my $key = $class->key_for_member($peer, $config);
     my $msg = $class->parse($line, $key, $config);
     return () unless $msg;
 
     HGLogger->info("Cluster: $msg->{action} for $msg->{ip} from $peer");
     return ($msg, $peer);
+}
+
+# Connections accepted from each member in the current minute.
+my %PEER_RATE;
+
+# How many messages one member may send per minute before the rest are
+# dropped. Overridden by CLUSTER_MAX_PER_MINUTE; 0 turns the limit off.
+our $MAX_PER_MINUTE = 120;
+
+# Whether a member is still inside its rate.
+#
+# A cluster carries a block or two at a time. A member sending hundreds a
+# minute is either broken or not being driven by its owner any more, and in
+# both cases the damage is the same shape: an authenticated flood of DENY that
+# walks the block list across every host in the group, or of UNBLOCK that
+# empties it, faster than anyone reading a log can react.
+#
+# The limit does not stop a compromised member from doing harm - it holds a
+# valid key, and one DENY is enough to be a nuisance. It bounds the rate at
+# which it can do harm to something an operator can notice and get in front of,
+# which is what a limit on a trusted party is for.
+sub _within_rate {
+    my ($peer, $config) = @_;
+
+    my $max = $config ? $config->{CLUSTER_MAX_PER_MINUTE} : undef;
+    $max = $MAX_PER_MINUTE unless defined $max && $max =~ /^\d+$/;
+    return 1 unless $max > 0;
+
+    my $minute = int(time() / 60);
+
+    # One bucket, dropped whole when the minute turns. A member list is a
+    # handful of entries, so there is nothing here worth expiring individually.
+    if (($PEER_RATE{minute} // -1) != $minute) {
+        %PEER_RATE = (minute => $minute);
+    }
+
+    my $count = ++$PEER_RATE{count}{$peer};
+    return 1 if $count <= $max;
+
+    # Said once per member per minute. A member that is flooding would
+    # otherwise flood the log as well, which is the same denial of service by
+    # another route.
+    HGLogger->log_warn("Cluster member $peer has sent $count messages this "
+                     . "minute, past the $max CLUSTER_MAX_PER_MINUTE allows; "
+                     . "the rest are being dropped. A member sending this many "
+                     . "is broken or no longer under its owner's control.")
+        if $count == $max + 1;
+
+    return 0;
 }
 
 ###############################################################################

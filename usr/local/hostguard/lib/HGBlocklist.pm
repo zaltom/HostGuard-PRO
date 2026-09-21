@@ -82,7 +82,7 @@ sub load {
         $line =~ s/\s+$//;
         next if $line eq '' || $line =~ /^#/;
 
-        my ($name, $interval, $max, $url) = split(/\|/, $line, 4);
+        my ($name, $interval, $max, $url, $verify) = split(/\|/, $line, 5);
 
         unless (defined $name && defined $interval && defined $max && defined $url) {
             HGLogger->error("Blocklist entry is not NAME|INTERVAL|MAX|URL: $line");
@@ -90,6 +90,7 @@ sub load {
         }
 
         for ($name, $interval, $max, $url) { s/^\s+//; s/\s+$//; }
+        if (defined $verify) { $verify =~ s/^\s+//; $verify =~ s/\s+$//; }
         $name = uc($name);
 
         unless ($name =~ /^[A-Z0-9]{1,$MAX_NAME_LEN}$/) {
@@ -128,16 +129,231 @@ sub load {
             $interval = $MIN_INTERVAL;
         }
 
+        my $check;
+        if (defined $verify && length $verify) {
+            $check = _parse_verify($name, $verify);
+            next unless $check;
+        }
+
         push @lists, {
             name     => $name,
             interval => $interval,
             max      => $max,
             url      => $url,
+            verify   => $check,
         };
     }
     close($fh);
 
     return @lists;
+}
+
+###############################################################################
+# Authenticity
+###############################################################################
+#
+# Everything else about a download asks whether it looks like a block list.
+# None of it asks who wrote it.
+#
+# The transport now insists on https, so the answer that arrives is the answer
+# the provider sent - but the provider is still a third party whose word this
+# host takes as firewall policy. A provider that is breached, whose account is
+# taken over, or whose own build pipeline is tampered with, publishes a list
+# that is correctly served, correctly signed by its certificate, and full of
+# whatever the attacker chose. Every check downstream of the download passes:
+# the file is addresses, the count has not fallen, no range is too wide. The
+# addresses are simply the wrong ones, and on a hosting server the wrong ones
+# are a customer's users.
+#
+# So an entry may name something to check the download against, as an optional
+# fifth field in blocklists.conf:
+#
+#   sha256=<64 hex>     a pinned digest, for a list that does not change
+#   sha256url=<url>     a digest published beside the list
+#   gpg=<url>           a detached OpenPGP signature, verified with gpgv
+#                       against BLOCKLIST_GPG_KEYRING
+#
+# What each is worth is different, and worth being clear about. A pinned digest
+# is the strongest and only suits a list that never changes. A digest URL is
+# only as good as where it is fetched from: served by the same host as the list
+# it describes, it catches a corrupted or truncated transfer and nothing else,
+# because whoever can change one can change the other; served from a different
+# host, it means both would have to be broken. A signature is the only one that
+# says who wrote the file rather than what it is, and it is the only one that
+# still holds if the provider's web host is taken over entirely.
+#
+# Anything named here is fetched under the same rules as the list itself: https
+# by default, no redirect to an address inside the host, bounded in size.
+
+# Largest verification file fetched. A digest is 64 bytes and a detached
+# signature a few hundred; nothing legitimate here is large.
+our $MAX_VERIFY_SIZE = 65536;
+
+# Split the fifth field of a blocklists.conf entry.
+#
+# Returns a hashref, or undef with the reason reported - in which case load()
+# drops the whole entry. Refusing the list rather than fetching it unverified
+# is the point: an operator who wrote a verification line and mistyped it has
+# said what they want, and quietly doing the weaker thing would leave them
+# believing the list was checked.
+sub _parse_verify {
+    my ($name, $spec) = @_;
+
+    my ($type, $value) = split(/=/, $spec, 2);
+    $type = lc($type // '');
+    $value = '' unless defined $value;
+    $value =~ s/^\s+//;
+    $value =~ s/\s+$//;
+
+    if ($type eq 'sha256') {
+        unless ($value =~ /^[0-9a-fA-F]{64}$/) {
+            HGLogger->error("Blocklist $name has a sha256 that is not 64 hex "
+                          . "characters: $value");
+            return undef;
+        }
+        return { type => 'sha256', value => lc($value) };
+    }
+
+    if ($type eq 'sha256url' || $type eq 'gpg') {
+        unless ($value =~ m{^https?://[^\s[:cntrl:]]+$}i) {
+            HGLogger->error("Blocklist $name has a $type that is not a usable "
+                          . "URL: $value");
+            return undef;
+        }
+        return { type => $type, value => $value };
+    }
+
+    HGLogger->error("Blocklist $name has an unknown verification type "
+                  . "'$type'. Use sha256=, sha256url= or gpg=.");
+    return undef;
+}
+
+# The SHA-256 of a file as lowercase hex, or undef.
+sub _sha256_file {
+    my ($file) = @_;
+
+    unless (eval { require Digest::SHA; 1 }) {
+        HGLogger->error("Digest::SHA is not available, so a downloaded list "
+                      . "cannot be checked against a digest. It ships with "
+                      . "Perl; on a stripped installation, install perl-Digest-SHA.");
+        return undef;
+    }
+
+    my $sha = eval { Digest::SHA->new(256) } or return undef;
+    return eval { $sha->addfile($file, 'b'); $sha->hexdigest } // undef;
+}
+
+# Fetch a small verification file that sits beside a list.
+#
+# Returns the path to fetch it into on success, or undef with the reason
+# reported. The caller unlinks it.
+sub _fetch_verify_file {
+    my ($name, $url, $dest, $config) = @_;
+
+    my $timeout = $config ? $config->get('BLOCKLIST_TIMEOUT') : undef;
+    $timeout = 60 unless defined $timeout && $timeout =~ /^\d+$/ && $timeout > 0;
+
+    my ($rc, $out) = _download($url, $dest, $timeout, $MAX_VERIFY_SIZE,
+                               allow_http($config));
+    if ($rc) {
+        HGLogger->error("Blocklist $name: cannot fetch $url (rc=$rc): $out");
+        unlink($dest);
+        return undef;
+    }
+    return $dest;
+}
+
+# Whether a downloaded file is what the entry says it should be.
+#
+# Returns undef when it is - including when the entry names nothing to check,
+# unless BLOCKLIST_REQUIRE_VERIFY says every list must name something - or the
+# reason it is not.
+sub _verify_reason {
+    my ($class, $entry, $file, $config) = @_;
+
+    my $check = $entry->{verify};
+
+    unless ($check) {
+        my $required = $config ? $config->get('BLOCKLIST_REQUIRE_VERIFY') : undef;
+        if (defined $required && $required =~ /^(1|yes|true|on)$/i) {
+            return "BLOCKLIST_REQUIRE_VERIFY is set and this list names nothing "
+                 . "to check the download against. Add a fifth field to its "
+                 . "line in blocklists.conf: sha256=, sha256url= or gpg=";
+        }
+        return undef;
+    }
+
+    if ($check->{type} eq 'sha256') {
+        my $got = _sha256_file($file);
+        return 'its digest could not be computed' unless defined $got;
+        return undef if $got eq $check->{value};
+        return "its SHA-256 is $got, and the entry pins $check->{value}. "
+             . "Either the list has been republished, in which case update the "
+             . "pin, or what arrived is not what was pinned";
+    }
+
+    if ($check->{type} eq 'sha256url') {
+        my $tmp = "$file.sha256";
+        return "the digest at $check->{value} could not be fetched"
+            unless _fetch_verify_file($entry->{name}, $check->{value}, $tmp, $config);
+
+        my $published = '';
+        if (open(my $fh, '<', $tmp)) {
+            # Providers publish either the bare digest or the output of
+            # sha256sum, which is "<digest>  <filename>". The first hex run of
+            # the right length is the digest in both.
+            local $/;
+            my $body = <$fh> // '';
+            close($fh);
+            ($published) = $body =~ /\b([0-9a-fA-F]{64})\b/;
+            $published = '' unless defined $published;
+        }
+        unlink($tmp);
+
+        return "the file at $check->{value} holds no SHA-256"
+            unless length $published;
+
+        my $got = _sha256_file($file);
+        return 'its digest could not be computed' unless defined $got;
+        return undef if $got eq lc($published);
+        return "its SHA-256 is $got and the digest published at "
+             . "$check->{value} is " . lc($published);
+    }
+
+    if ($check->{type} eq 'gpg') {
+        my $keyring = $config ? $config->get('BLOCKLIST_GPG_KEYRING') : undef;
+        unless (defined $keyring && length $keyring) {
+            return "it names a signature but BLOCKLIST_GPG_KEYRING is not set, "
+                 . "so there is no key to verify it against";
+        }
+        unless (-f $keyring) {
+            return "BLOCKLIST_GPG_KEYRING is $keyring, which is not a file";
+        }
+
+        my $gpgv = HGConfig::find_bin('gpgv');
+        unless ($gpgv) {
+            return "it names a signature but gpgv is not installed";
+        }
+
+        my $sig = "$file.sig";
+        return "the signature at $check->{value} could not be fetched"
+            unless _fetch_verify_file($entry->{name}, $check->{value}, $sig, $config);
+
+        # gpgv and not gpg: it verifies against one keyring and does nothing
+        # else. gpg would consult the root user's own keyring and its trust
+        # model, neither of which has anything to do with this.
+        my ($rc, $out) = HGConfig::run_command($gpgv, '--keyring', $keyring,
+                                               $sig, $file);
+        unlink($sig);
+        return undef unless $rc;
+
+        $out = '' unless defined $out;
+        $out =~ s/\s+/ /g;
+        $out = substr($out, 0, 300);
+        return "its signature does not verify against $keyring (gpgv said: $out)";
+    }
+
+    return "it names an unknown verification type '$check->{type}'";
 }
 
 ###############################################################################
@@ -211,6 +427,16 @@ sub refresh {
     if ($rc) {
         unlink($tmp);
         HGLogger->error("Blocklist $entry->{name} download failed (rc=$rc): $out");
+        return 0;
+    }
+
+    # Before it is parsed, and before anything about it is believed. A file
+    # that fails this is not evidence of anything - not a shrunken list, not a
+    # changed format - so none of the checks below are run on it.
+    if (my $why = $class->_verify_reason($entry, $tmp, $config)) {
+        unlink($tmp);
+        HGLogger->error("Blocklist $entry->{name} was not applied because "
+                      . "$why; keeping the previous copy");
         return 0;
     }
 
@@ -289,6 +515,8 @@ sub parse_file {
 #   valid       lines whose first token was an address or CIDR range
 #   kept        entries actually stored, so valid minus duplicates
 #   capped      true when reading stopped at the list's configured maximum
+#   overflow    true when reading stopped because the file holds more than an
+#               ipset here can carry
 #   too_broad   entries reaching further than MIN_PREFIX4/MIN_PREFIX6 allow
 #   broad_eg    one of those, to name in the message
 sub parse_with_stats {
@@ -297,7 +525,21 @@ sub parse_with_stats {
 
     my @entries;
     my %stats = (considered => 0, valid => 0, kept => 0, capped => 0,
-                 too_broad => 0, broad_eg => undef);
+                 overflow => 0, too_broad => 0, broad_eg => undef);
+
+    # Where reading stops regardless of what the entry asked for.
+    #
+    # A list with no MAX is read to the end, and the end of BLOCKLIST_MAX_SIZE
+    # bytes of short lines is a few million of them - each one an array element
+    # and a hash key, which is a few hundred megabytes of this process for a
+    # file that was always going to be refused. _reject_reason turns down
+    # anything above SET_MAXELEM, because an ipset here cannot hold it, so
+    # there is nothing to learn from the lines past that point except how much
+    # memory it takes to hold them.
+    #
+    # One past the ceiling, so that "more than fits" is still distinguishable
+    # from "exactly fills".
+    my $ceiling = $HGConfig::SET_MAXELEM + 1;
 
     open(my $fh, '<', $file) or return (\@entries, \%stats);
 
@@ -335,6 +577,10 @@ sub parse_with_stats {
         push @entries, $token;
         if ($max && @entries >= $max) {
             $stats{capped} = 1;
+            last;
+        }
+        if (@entries >= $ceiling) {
+            $stats{overflow} = 1;
             last;
         }
     }
@@ -442,11 +688,11 @@ sub _reject_reason {
     # including the one an administrator runs to fix a lockout or apply an
     # emergency block. Refusing the download instead keeps the previous copy
     # and keeps the firewall reloadable.
-    if (scalar(@$entries) > $HGConfig::SET_MAXELEM) {
-        return "it holds " . scalar(@$entries) . " entries, more than the "
-             . "$HGConfig::SET_MAXELEM an ipset here can hold. Loading it "
-             . "would make every firewall reload fail. Set a MAX for this list "
-             . "in blocklists.conf, or lower BLOCKLIST_MAX_SIZE";
+    if ($stats->{overflow} || scalar(@$entries) > $HGConfig::SET_MAXELEM) {
+        return "it holds more than the $HGConfig::SET_MAXELEM entries an ipset "
+             . "here can hold. Loading it would make every firewall reload "
+             . "fail. Set a MAX for this list in blocklists.conf, or lower "
+             . "BLOCKLIST_MAX_SIZE";
     }
 
     my $considered = $stats->{considered} || 0;

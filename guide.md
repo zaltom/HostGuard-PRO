@@ -567,6 +567,21 @@ because they carry different risk:
 **Quick Add** takes one address, validates it, and hands it to the CLI. It
 works whatever `RESTRICT_UI` is set to.
 
+**Some settings are never editable from the browser**, whatever `RESTRICT_UI`
+says. `HOOKS_ENABLE`, `PRE_SCRIPT`, `POST_SCRIPT`, `BLOCK_REPORT`, `IPTABLES`,
+`IP6TABLES`, `IPSET`, `TESTING`, `RESTRICT_UI`, `CLUSTER_KEY_FILE`,
+`BLOCKLIST_ALLOW_HTTP`, `BLOCKLIST_REQUIRE_VERIFY` and
+`BLOCKLIST_GPG_KEYRING` name a program that runs as root, decide whether
+downloaded data is authenticated, or switch the firewall off on a timer. A save
+that changes one is refused and the attempt is logged; everything else in the
+file saves normally.
+
+`RESTRICT_UI` has only two positions, and an operator who wants to adjust a
+block duration from the browser had to accept every other setting being
+adjustable from there too. This is not a defence against root - anyone with a
+shell can edit the file, and this list with it. It narrows what an
+authenticated browser session is worth.
+
 **The bulk editor** replaces the whole file. It answers to `RESTRICT_UI` in the
 same way the configuration editor does, and with the shipped default
 (`RESTRICT_UI=1`) it is read-only. These files are firewall policy: the
@@ -658,7 +673,7 @@ block them at the firewall. Lists are defined in
 `/etc/hostguard/blocklists.conf`, one per line:
 
 ```
-NAME|INTERVAL|MAX|URL
+NAME|INTERVAL|MAX|URL[|VERIFY]
 ```
 
 | Field | Meaning |
@@ -667,6 +682,7 @@ NAME|INTERVAL|MAX|URL
 | `INTERVAL` | Refresh interval in seconds. Values below 3600 are raised to 3600. |
 | `MAX` | Maximum addresses to import, or `0` for the whole list. |
 | `URL` | `https://` address of the list. A plain `http://` source is refused unless `BLOCKLIST_ALLOW_HTTP` is set. |
+| `VERIFY` | Optional. `sha256=`, `sha256url=` or `gpg=`, checked before the download is believed. See [Who wrote the list](#who-wrote-the-list). |
 
 Several well-known lists ship commented out. Remove the leading `#` to enable
 one:
@@ -800,6 +816,8 @@ Country zone files work the same way, for the same reasons.
 | `BLOCKLIST_TIMEOUT` | Seconds to wait for a download |
 | `BLOCKLIST_MAX_SIZE` | Largest download accepted, in bytes |
 | `BLOCKLIST_ALLOW_HTTP` | Accept a source served over plain http (1=yes, 0=no) |
+| `BLOCKLIST_REQUIRE_VERIFY` | Refuse a list that names no digest or signature (1=yes, 0=no) |
+| `BLOCKLIST_GPG_KEYRING` | Keyring `gpgv` verifies signed lists against |
 | `BLOCKLIST_MIN_VALID_PERCENT` | Share of content lines that must be addresses (0 disables) |
 | `BLOCKLIST_MAX_SHRINK_PERCENT` | How far a list may fall below its previous copy (100 disables) |
 
@@ -868,6 +886,48 @@ data over the same transport deciding the same thing.
 None of this replaces the checks on the content below. A list fetched from an
 address that passed is still parsed, still measured against the copy it
 replaces, and still refused if it does not look like a block list.
+
+### Who wrote the list
+
+Every other check asks whether a download looks like a block list. None of them
+asks who wrote it.
+
+`https` says the answer came from the provider. It does not say the provider is
+still the party you think it is. An account taken over, a breached web host, a
+tampered build pipeline: each publishes a list that is correctly served,
+correctly certified, and full of whatever the attacker chose. Every check on
+this page passes it. The file is addresses, the count has not fallen, no range
+is too wide. They are simply the wrong addresses - and on a hosting server the
+wrong addresses are somebody's customers, blocked at the firewall, with the
+cause looking exactly like a legitimate feed update.
+
+So a list may name something to check the download against, as an optional
+fifth field on its line in `blocklists.conf`:
+
+```
+MYLIST|86400|500000|https://lists.example/ips.txt|gpg=https://lists.example/ips.txt.sig
+```
+
+| Form | What it establishes |
+|------|---------------------|
+| `sha256=<64 hex>` | The file is byte for byte the one pinned. Strongest, and only useful for a list that does not change. |
+| `sha256url=<url>` | The file matches a digest published beside it. On the same host as the list this catches a truncated or corrupted transfer and nothing else - whoever can change one can change the other. On a different host, both would have to be broken. |
+| `gpg=<url>` | A detached OpenPGP signature verifies against `BLOCKLIST_GPG_KEYRING`. The only form that says who wrote the file rather than what it is, and the only one that still holds if the provider's web host is taken over entirely. |
+
+Verification runs on the downloaded file before it is parsed, so a file that
+fails is not evidence of anything - not a shrunken list, not a changed format -
+and none of the other checks are run on it. The previous copy is kept.
+Signatures are checked with `gpgv` against one named keyring, not with `gpg`,
+which would consult root's own keyring and trust model; neither has anything to
+do with whether a block list is genuine.
+
+A line whose fifth field is malformed is dropped rather than fetched unchecked.
+Writing a verification line and mistyping it should not quietly get you the
+weaker thing.
+
+`BLOCKLIST_REQUIRE_VERIFY` turns the field from optional into required. It ships
+off, because most providers publish nothing to check against and turning it on
+where no entry carries a field would disable every list.
 
 Enabling a list blocks every network it names, so use sources you trust and
 check the entry count with `hostguard -s` after the first update.
@@ -1571,6 +1631,8 @@ CLUSTER_ENABLE = "1"
 CLUSTER_PORT = "7654"
 CLUSTER_BIND = "203.0.113.10"    # this member's own interface
 CLUSTER_WINDOW = "300"
+CLUSTER_ACCEPT_ACTIONS = "DENY,TEMPDENY,UNBLOCK,PING"
+CLUSTER_MAX_PER_MINUTE = "120"
 ```
 
 Open the port to members only, never to the internet. Add each member to the
@@ -1593,19 +1655,76 @@ hostguard --cluster ping     # confirm members are reachable
 A message is a single authenticated line over TCP:
 
 ```
-HG1|<timestamp>|<action>|<address>|<reason>|<hmac>
+HG2|<timestamp>|<nonce>|<action>|<address>|<reason>|<hmac>
 ```
 
-Three things must hold before a message is acted on: the sender is a configured
-member, the HMAC over the contents verifies, and the timestamp is inside
-`CLUSTER_WINDOW` seconds of now. The secret is never sent. The last check is
-what stops a message captured today from being replayed next week, which is
-why **members need roughly synchronised clocks**. Run NTP.
+Four things must hold before a message is acted on: the sender is a configured
+member, the HMAC over the contents verifies, the timestamp is inside
+`CLUSTER_WINDOW` seconds of now, and the nonce has not been seen before. The
+secret is never sent. The timestamp is what stops a message captured today from
+being replayed next week, which is why **members need roughly synchronised
+clocks** - run NTP - and the nonce is what stops one being replayed in the next
+five minutes.
 
-Only `DENY`, `TEMPDENY`, `ALLOW`, `UNBLOCK` and `PING` are accepted. A member
-cannot ask another to run a command, change its configuration or read a file;
-the protocol has no way to express any of those. A member applies what it is
+Only `DENY`, `TEMPDENY`, `ALLOW`, `UNBLOCK` and `PING` can be expressed. A
+member cannot ask another to run a command, change its configuration or read a
+file; the protocol has no way to say any of those. A member applies what it is
 told and does not pass it on, so a block cannot loop around the cluster.
+
+### What one member can do to the rest
+
+Everything above is about a message being genuine. None of it is about the
+member that sent it being trustworthy, and in a cluster every member trusts
+every other one completely - that is what a shared secret means. So the useful
+question is not whether a message can be forged but what the worst genuine one
+can do, and the answer differed by action.
+
+**Not every action is accepted.** `DENY`, `TEMPDENY` and `UNBLOCK` move
+addresses in and out of the block lists. That is what a cluster is for, and it
+is undone in one command. `ALLOW` is different in kind: it appends to
+`allow.conf` permanently, and an allowlisted address bypasses every block on
+the host, including ones this firewall would place itself. One compromised
+member could allowlist an attacker's range across the entire group, and the
+entry survives every reload and looks exactly like a deliberate one.
+
+`CLUSTER_ACCEPT_ACTIONS` is the list this host will act on, and it ships
+without `ALLOW`:
+
+```
+CLUSTER_ACCEPT_ACTIONS = "DENY,TEMPDENY,UNBLOCK,PING"
+```
+
+Add `ALLOW` if the cluster genuinely propagates allowlist entries. `PING` is
+always accepted - it carries no instruction, and a member that cannot be pinged
+looks broken to every diagnostic here.
+
+**A member has a rate.** `CLUSTER_MAX_PER_MINUTE` (120 by default, 0 to
+disable) bounds how many messages one member can have acted on per minute. A
+cluster carries a block or two at a time; a member sending hundreds is broken
+or no longer under its owner's control, and either way the damage has the same
+shape - an authenticated flood of `DENY` walking the block list across every
+host, or of `UNBLOCK` emptying it, faster than anyone reading a log can react.
+This does not stop a compromised member doing harm. It bounds the rate to
+something an operator can get in front of.
+
+**A member can be revoked on its own.** With one shared secret there is one
+thing to lose and no way to lose it in isolation: a member that is compromised
+holds the key every member uses, so recovering means generating a new secret
+and reaching every host in the group before any of them can talk again. A
+member may instead be given its own key in `cluster.conf`:
+
+```
+203.0.113.11  key=<64 hex characters>
+```
+
+The member signs with whatever is in its own `cluster.key`, so the key goes in
+that file on that host and in this line on every other host. The answer to a
+compromised member is then to delete its line. There is no falling back to the
+shared secret for a member named with a key - otherwise removing the line would
+leave it trusted anyway, which is the opposite of the point.
+
+`cluster.conf` holds secrets once any member carries a key, so it is mode 0600
+and the security check says so if it is not.
 
 ### What a broadcast costs the daemon
 
@@ -1895,6 +2014,42 @@ journalctl -u hostguardd | grep -i 'permission denied\|read-only'
 
 An `EROFS` or `EPERM` in the journal after an upgrade almost always means a
 path or capability is missing from the unit rather than a bug in the daemon.
+
+### Hooks are off until they are turned on
+
+`PRE_SCRIPT`, `POST_SCRIPT` and `BLOCK_REPORT` each name a program that runs as
+root, so they are ignored entirely unless `HOOKS_ENABLE` is 1. It ships as 0.
+
+The file checks were never the weak part. Anything able to write one line of
+`hostguard.conf` can name a program for this software to run as root, and that
+is a wider set of things than the file: a restored backup, a configuration
+management template, a support script, a WHM session, a future release that
+gives the plugin a narrower ACL. A host that does not use hooks should not be
+one edited line away from arbitrary root execution, and almost none do. An
+operator who wants a hook turns the switch on once, deliberately, where a diff
+and the security check can both see it.
+
+A hook that is allowed to run still has to be an absolute path to a regular
+executable file owned by root and not writable by anyone else, in a directory
+chain only root can change. If it is a symlink, the same is required of *every
+name it passes through* - a root-owned script in a user's home directory,
+reached through a link in `/usr/local/sbin`, passes every test applied to the
+link and is replaceable by the user who owns the home directory.
+
+The chain is followed one link at a time rather than resolved in one step,
+because resolving it in one step reintroduces the same hole one hop further in.
+Given `/usr/local/sbin/hg-hook` -> `/home/alice/link` -> `/root/actual`, a
+single resolution answers `/root/actual`; both ends are root's, both directory
+walks pass, and `/home/alice` is never looked at - so alice repoints the middle
+link and root runs her program on the next reload. A path is also refused if it
+passes through more than eight links, or if following one produces a `..`,
+which would make the directory walk check the wrong directories.
+
+It is also bounded. `HOOK_TIMEOUT` seconds, then `SIGTERM`, then `SIGKILL`. The
+pre and post scripts run while the firewall lock is held and the block report
+runs on the daemon's main loop, so a hook that blocks on a network call or a
+full disk used to stop log reading, block expiry and cluster listening along
+with it.
 
 ### If a hook needs more
 

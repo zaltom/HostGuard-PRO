@@ -312,6 +312,21 @@ sub _process_post_action {
         if ($conf->{RESTRICT_UI} && $conf->{RESTRICT_UI} ne "0") {
             $msg = "UI config changes are restricted. Change via SSH.";
             $type = 'danger';
+        } elsif (my @locked = HGConfig->protected_changes($cfg_text, $conf)) {
+            # A handful of settings are not editable from a browser at all.
+            # They name a program to run as root, decide whether downloaded
+            # data is authenticated, or switch the firewall off on a timer, and
+            # a WHM session left open should not be one submission away from
+            # any of that. See HGConfig::PROTECTED_KEYS.
+            _audit("attempted to change protected setting(s): "
+                 . join(', ', @locked));
+            $msg = "This save changes " . join(', ', @locked) . ", which the "
+                 . "browser cannot change. Those settings name programs run as "
+                 . "root or decide whether downloaded lists are verified, so "
+                 . "they are edited over SSH. Everything else in the file can "
+                 . "be saved here.";
+            $type = 'danger';
+
         } else {
             my $file = "$HGConfig::CONFIG_DIR/hostguard.conf";
 
