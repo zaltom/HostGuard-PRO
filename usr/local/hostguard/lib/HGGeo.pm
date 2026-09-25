@@ -495,6 +495,17 @@ sub cached_ranges {
         chomp $line;
         next unless length $line;
 
+        # Validated before it is handed to "ipset restore", as HGBlocklist does
+        # with its cache. The cache is written from ranges that already parsed,
+        # so on the ordinary path this drops nothing; a file edited by hand or
+        # restored from a backup does not go through the writer, and a line that
+        # is not a range of this family has no business reaching the kernel.
+        if ($family eq 'inet6') {
+            next unless HGConfig->valid_ipv6($line);
+        } else {
+            next unless HGConfig->valid_ipv4($line);
+        }
+
         if (HGConfig::too_broad($line, $config)) {
             $too_broad++;
             $example //= $line;

@@ -49,6 +49,18 @@ sub _log {
     if (!defined $msg) {
         $msg = $class_or_msg;
     }
+    $msg = '' unless defined $msg;
+
+    # Fold control characters before the line is written.
+    #
+    # Much of what is logged is drawn from things the other side chooses: a
+    # process command line, a file name in /tmp, a log line being echoed back. A
+    # newline in one of those would forge a second log entry - a fake "[INFO]
+    # unblocked ..." line, say - and terminal escape codes would run when someone
+    # reads the log with a pager. A real newline becomes a space so the message
+    # stays one line; the tab that formats some lines is left alone.
+    $msg =~ s/[\r\n]+/ /g;
+    $msg =~ tr/\x00-\x08\x0b\x0c\x0e-\x1f\x7f/ /;
 
     _rotate_if_needed();
 

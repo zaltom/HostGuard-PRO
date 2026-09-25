@@ -25,7 +25,10 @@ package HGWatch;
 ###############################################################################
 use strict;
 use warnings;
-use Fcntl qw(:DEFAULT :flock);
+# O_NONBLOCK and O_NOFOLLOW: a file is opened for digesting without following a
+# final symlink and without blocking, so a FIFO or a symlink to a device cannot
+# hold the daemon's main loop. See _file_digest.
+use Fcntl qw(:DEFAULT :flock O_RDONLY O_NONBLOCK O_NOFOLLOW);
 use HGConfig;
 use HGLogger;
 
@@ -663,6 +666,18 @@ sub _stamp_file {
 
     my $stamp = join(':', 'f', $s[7], $s[9], sprintf('%04o', $s[2] & 07777), $s[4], $s[5]);
 
+    # Only a regular file is opened and digested. Anything else at the path - a
+    # FIFO, a device, a socket, or a symlink to one - is recorded by its metadata
+    # alone and never read: a named pipe would block the daemon's main loop until
+    # something wrote to it, and /dev/zero would never end. The type is part of
+    # the metadata stamp above, so a change of type is still reported. The
+    # integrity caller passes @$st for a path it has already confirmed is a
+    # regular file; the watch caller lstats a directory child, which may be any
+    # of these.
+    unless (($s[2] & 0170000) == 0100000) {    # S_IFREG
+        return $stamp . ':special';
+    }
+
     my $max = $config->{INTEGRITY_MAX_SIZE} // 10485760;
     $max = 10485760 unless $max =~ /^\d+$/;
 
@@ -709,14 +724,30 @@ sub _stamp_dir {
 #
 # Digest::SHA is core Perl and present on cPanel servers. Without it the stamp
 # falls back to metadata alone, which still detects a replaced binary.
+#
+# The file is opened here rather than by passing a path to addfile, so that two
+# things hold that a path cannot promise. O_NOFOLLOW refuses a final symlink,
+# and O_NONBLOCK keeps even the open from blocking on a FIFO. The descriptor is
+# then confirmed to be a regular file with fstat before a byte is read: _stamp_file
+# has already checked the path with lstat, but between that check and this open a
+# regular file can be replaced by a FIFO or a device, and reading either would
+# hold the daemon's main loop. Deciding from the open descriptor closes that gap.
 sub _file_digest {
     my ($path) = @_;
 
     my $hex = eval {
         require Digest::SHA;
+        sysopen(my $fh, $path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW) or return undef;
+        my @st = stat($fh);
+        unless (@st && ($st[2] & 0170000) == 0100000) {    # not S_IFREG
+            close($fh);
+            return undef;
+        }
+        binmode($fh);
         my $sha = Digest::SHA->new(256);
-        $sha->addfile($path);
-        $sha->hexdigest;
+        $sha->addfile($fh);
+        close($fh);
+        return $sha->hexdigest;
     };
     return $hex if defined $hex && length $hex;
     return undef;

@@ -637,9 +637,21 @@ sub parse {
         return undef;
     }
 
-    unless ($action eq 'PING' || HGConfig->valid_ip($ip)) {
-        HGLogger->log_warn("Cluster message carries an invalid address");
-        return undef;
+    # A single host, not a range. The daemon only ever propagates single
+    # addresses, so a CIDR here is either a mistake or an attempt to move a large
+    # part of the address space in one authenticated message: "DENY 0.0.0.0/0"
+    # drops every source that is not allowlisted on every member, and an accepted
+    # "ALLOW" of a wide range allowlists it across the whole cluster. Both
+    # survive reloads. A member with a valid key is trusted, but the point of
+    # bounding what a trusted member can ask - as CLUSTER_ACCEPT_ACTIONS and the
+    # rate limit already do - is that the worst authenticated message stays small,
+    # and a single blocked or unblocked host is that bound.
+    unless ($action eq 'PING') {
+        unless (defined $ip && HGConfig->valid_ip($ip) && $ip !~ m{/}) {
+            HGLogger->log_warn("Cluster message carries an address that is not a "
+                             . "single host; refusing it");
+            return undef;
+        }
     }
 
     return {

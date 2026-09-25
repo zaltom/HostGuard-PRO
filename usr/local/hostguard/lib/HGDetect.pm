@@ -93,16 +93,21 @@ our %FAILURE = (
         qr/sshd\[\d+\]:\s+User .*from $IPN not allowed because/,
     ],
 
-    # Each of these brackets or quotes the address, and the pattern requires
-    # that delimiter plus the end of the line where the daemon puts it there.
-    # The runs are greedy for a reason: a non-greedy one would take the first
-    # address-shaped token on the line, which a user name can supply.
+    # Each of these reads the client address from a field the FTP daemon writes
+    # itself, never from the account name, which the client chooses. pure-ftpd
+    # writes the address in its "(?@ADDR)" prefix and the account name last in
+    # "[USER]"; proftpd writes it in the "(host[ADDR])" group ahead of the USER
+    # token; vsftpd writes it in Client "ADDR". Reading pure-ftpd's address from
+    # the trailing bracket, as this once did, let a login as user "8.8.8.8"
+    # choose the address to block, and made a real brute force invisible because
+    # an ordinary user name never looks like an address.
     ftpd => [
-        # pure-ftpd
-        qr/pure-ftpd.*\[WARNING\] Authentication failed for user .*\[$IPN\]\s*$/,
-        # proftpd
-        qr/proftpd\[\d+\].*no such user.*\[$IPN\]/i,
-        qr/proftpd\[\d+\].*Login failed.*\[$IPN\]/i,
+        # pure-ftpd: (?@ADDR) [WARNING] Authentication failed for user [USER]
+        qr/pure-ftpd(?:\[\d+\])?:\s*\([^()\@]*\@(?:::ffff:)?$IPN\)\s+\[WARNING\] Authentication failed for user\b/,
+        # proftpd: NAME (host[ADDR]) ... USER x: no such user / Login failed.
+        # Non-greedy to the first bracketed address, which is proftpd's own; the
+        # account name follows it and so cannot supply an earlier one.
+        qr/proftpd\[\d+\].*?\([^\[\]()]*\[(?:::ffff:)?$IPN\]\).*(?:no such user|Login failed)/i,
         # vsftpd writes both to its own log and to syslog; both shapes appear.
         qr/vsftpd.*\[pid \d+\].*FAIL LOGIN: Client "$IPN"\s*$/,
         qr/FAIL LOGIN: Client "$IPN"\s*$/,
@@ -272,6 +277,33 @@ our @LOG_KEYS = qw(
     LOG_SUHOSIN
 );
 
+# The log file(s) each built-in service's lines legitimately come from, named by
+# configuration key.
+#
+# A service's patterns are only tested against a line that was read from one of
+# its own files. Without this, every pattern was tried against every line, and
+# the failure logs share a machine: a user name is copied verbatim into a mail
+# or FTP log by the daemon that received it, the client chooses that user name,
+# and a pattern belonging to another service - the cPanel ones match anywhere on
+# a line - could then claim the line and block whatever address the user name
+# contained. Tying a service to its files is what the custom patterns already do
+# with the file they name; this applies the same rule to the built-in set.
+#
+# A service absent from this map is matched against any file, and a call that
+# does not name the file matches as before, so nothing here narrows a caller
+# that has no file to give.
+our %SERVICE_LOGS = (
+    sshd     => [qw(LOG_SSHD LOG_SSHD_ALT)],
+    ftpd     => [qw(LOG_FTPD LOG_FTPD_ALT)],
+    pop3d    => [qw(LOG_MAIL LOG_MAIL_ALT)],
+    imapd    => [qw(LOG_MAIL LOG_MAIL_ALT)],
+    smtpauth => [qw(LOG_MAIL LOG_MAIL_ALT)],
+    cpanel   => [qw(LOG_CPANEL LOG_CPANEL_ERROR)],
+    htpasswd => [qw(LOG_APACHE_ERROR)],
+    modsec   => [qw(LOG_APACHE_ERROR LOG_MODSEC)],
+    suhosin  => [qw(LOG_SUHOSIN)],
+);
+
 ###############################################################################
 # Custom patterns
 ###############################################################################
@@ -382,13 +414,20 @@ sub load_custom {
 # Returns (service, ip) for the first match, or an empty list. Each line is
 # attributed to a single service: the first pattern set to claim it wins,
 # which keeps one event from being counted twice.
+#
+# $file, when given, is the log file the line came from. A service is only
+# tested against a line from one of its own files (see %SERVICE_LOGS), so a user
+# name written into another daemon's log cannot be claimed by this service's
+# patterns.
 sub match_failure {
-    my ($class, $line, $config) = @_;
+    my ($class, $line, $config, $file) = @_;
 
     for my $service (sort keys %FAILURE) {
         my $key = $THRESHOLD{$service} or next;
         my $threshold = $config->{$key} // 0;
         next unless $threshold =~ /^\d+$/ && $threshold > 0;
+
+        next if defined $file && !_service_reads_file($service, $config, $file);
 
         for my $re (@{$FAILURE{$service}}) {
             next unless $line =~ $re;
@@ -399,6 +438,23 @@ sub match_failure {
     }
 
     return ();
+}
+
+# Whether a built-in service is configured to read the given file.
+#
+# The comparison is against the paths the configuration names, which are the
+# same paths the daemon opened, so a plain string match is exact. A service with
+# no file list matches any file, which keeps a service this map does not cover
+# behaving as it did.
+sub _service_reads_file {
+    my ($service, $config, $file) = @_;
+
+    my $keys = $SERVICE_LOGS{$service} or return 1;
+    for my $key (@$keys) {
+        my $path = $config->{$key};
+        return 1 if defined $path && length $path && $path eq $file;
+    }
+    return 0;
 }
 
 # Test one line against the successful-login patterns.

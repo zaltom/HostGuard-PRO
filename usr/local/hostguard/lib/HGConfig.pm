@@ -262,10 +262,14 @@ sub valid_ipv4 {
     return 0 unless defined $ip;
     # Strip CIDR
     my ($addr, $cidr) = split(/\//, $ip, 2);
-    return 0 unless $addr =~ /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+    # Anchored with \z, not $. A trailing $ matches before a final newline, so
+    # "1.2.3.4\n" would validate and then be written into a list file or handed
+    # on as a one-line value that is really two. \z requires the string to end
+    # exactly at the address.
+    return 0 unless $addr =~ /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\z/;
     return 0 if $1 > 255 || $2 > 255 || $3 > 255 || $4 > 255;
     if (defined $cidr) {
-        return 0 unless $cidr =~ /^\d{1,2}$/;
+        return 0 unless $cidr =~ /^\d{1,2}\z/;
         return 0 if $cidr > 32;
     }
     return 1;
@@ -280,7 +284,8 @@ sub valid_ipv6 {
     return 0 unless defined $ip;
     my ($addr, $cidr) = split(/\//, $ip, 2);
     if (defined $cidr) {
-        return 0 unless $cidr =~ /^\d{1,3}$/;
+        # \z rather than $, so a trailing newline in the prefix is not accepted.
+        return 0 unless $cidr =~ /^\d{1,3}\z/;
         return 0 if $cidr > 128;
     }
     return defined _ip6_to_bytes($addr) ? 1 : 0;
@@ -1425,6 +1430,14 @@ sub safe_to_exec {
 # of those should be one form submission away from arbitrary root execution,
 # and none of them has any business turning off list verification.
 #
+# The last four in the list are a second kind again: each one points a root
+# process at a file it will read or serve, or loosens what the cluster accepts.
+# LOG_FILE is displayed by the WHM log viewer, so a browser able to set it could
+# read any file on the host - /etc/shadow, cluster.key - through the viewer.
+# NOTICE_FILE is served verbatim to blocked visitors by the root daemon.
+# CLUSTER_ACCEPT_ACTIONS and CLUSTER_BIND decide what the cluster acts on and
+# where it listens. None of these is something a browser session should settle.
+#
 # So they are settled at the shell, by somebody on the host, and the editor
 # refuses a save that changes one. It is not a defence against root - anyone
 # with a shell can edit the file and this list with it. It narrows what an
@@ -1443,6 +1456,10 @@ our @PROTECTED_KEYS = qw(
     BLOCKLIST_ALLOW_HTTP
     BLOCKLIST_REQUIRE_VERIFY
     BLOCKLIST_GPG_KEYRING
+    LOG_FILE
+    NOTICE_FILE
+    CLUSTER_ACCEPT_ACTIONS
+    CLUSTER_BIND
 );
 
 sub protected_keys { return @PROTECTED_KEYS }

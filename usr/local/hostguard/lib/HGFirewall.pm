@@ -85,6 +85,11 @@ my ($CHAIN_IN, $CHAIN_OUT, $CHAIN_DENY, $CHAIN_ALLOW, $CHAIN_LOGDROP,
 # With the rules in chains, the jump decides the position, and appending inside
 # each chain preserves the order the lines appear in the file.
 my ($CHAIN_AALLOW_IN, $CHAIN_AALLOW_OUT, $CHAIN_ADENY_IN, $CHAIN_ADENY_OUT);
+# The IPv6 counterparts of the advanced-filter chains. A source-less advanced
+# filter selects on protocol and ports alone, so it applies to both families;
+# without these chains such a filter held on IPv4 and silently not on IPv6. See
+# _apply_advanced_filter.
+my ($CHAIN6_AALLOW_IN, $CHAIN6_AALLOW_OUT, $CHAIN6_ADENY_IN, $CHAIN6_ADENY_OUT);
 my ($SET_ALLOW4, $SET_DENY4, $SET_TEMP4, $SET_ALLOW6, $SET_DENY6, $SET_TEMP6);
 
 # Commands that failed while a ruleset was being built. A slot with any entry
@@ -156,6 +161,10 @@ sub _use_slot {
     $CHAIN6_LOGDROP = "HOSTGUARD6_LOGDROP$slot";
     $CHAIN6_SYNFLOOD= "HOSTGUARD6_SYNFLOOD$slot";
     $CHAIN6_SCAN    = "HOSTGUARD6_SCAN$slot";
+    $CHAIN6_AALLOW_IN  = "HOSTGUARD6_AALLOW_IN$slot";
+    $CHAIN6_AALLOW_OUT = "HOSTGUARD6_AALLOW_OUT$slot";
+    $CHAIN6_ADENY_IN   = "HOSTGUARD6_ADENY_IN$slot";
+    $CHAIN6_ADENY_OUT  = "HOSTGUARD6_ADENY_OUT$slot";
 
     # ipset names are lowercase by convention; all stay under the 31-char cap.
     my $t = lc($slot);
@@ -1986,7 +1995,8 @@ sub _teardown_slot {
     if ($IP6TABLES) {
         for my $chain ($CHAIN6_IN, $CHAIN6_OUT, $CHAIN6_DENY, $CHAIN6_ALLOW,
                        $CHAIN6_GEO, $CHAIN6_LOGDROP, $CHAIN6_SYNFLOOD,
-                       $CHAIN6_SCAN) {
+                       $CHAIN6_SCAN, $CHAIN6_AALLOW_IN, $CHAIN6_AALLOW_OUT,
+                       $CHAIN6_ADENY_IN, $CHAIN6_ADENY_OUT) {
             for my $builtin ('INPUT', 'OUTPUT') {
                 for (1 .. 10) {
                     my ($rc) = _run_quiet($IP6TABLES, '-D', $builtin, '-j', $chain);
@@ -2471,6 +2481,10 @@ sub _build_rules6 {
     _run($IP6TABLES, '-N', $CHAIN6_ALLOW);
     _run($IP6TABLES, '-N', $CHAIN6_DENY);
     _run($IP6TABLES, '-N', $CHAIN6_LOGDROP);
+    _run($IP6TABLES, '-N', $CHAIN6_AALLOW_IN);
+    _run($IP6TABLES, '-N', $CHAIN6_AALLOW_OUT);
+    _run($IP6TABLES, '-N', $CHAIN6_ADENY_IN);
+    _run($IP6TABLES, '-N', $CHAIN6_ADENY_OUT);
 
     # Log-and-drop, as on the IPv4 side.
     #
@@ -2571,6 +2585,13 @@ sub _build_rules6 {
         _run($IP6TABLES, '-A', $CHAIN6_IN,  @state, 'INVALID', '-j', $logdrop);
     }
 
+    # Outbound advanced filters, allow before deny and both after the state
+    # match, exactly as the IPv4 side places them: an established conversation is
+    # not cut by a rule about new ones. A source-less outbound filter has to
+    # apply here as well as on IPv4, or it would hold on one family only.
+    _run($IP6TABLES, '-A', $CHAIN6_OUT, '-j', $CHAIN6_AALLOW_OUT);
+    _run($IP6TABLES, '-A', $CHAIN6_OUT, '-j', $CHAIN6_ADENY_OUT);
+
     # Allowlist
     if ($USE_IPSET) {
         _run($IP6TABLES, '-A', $CHAIN6_IN,
@@ -2579,6 +2600,10 @@ sub _build_rules6 {
              '-m', 'set', '--match-set', $SET_TALLOW6, 'src', '-j', 'ACCEPT');
     }
     _run($IP6TABLES, '-A', $CHAIN6_IN, '-j', $CHAIN6_ALLOW);
+
+    # Inbound advanced allows sit with the rest of the allowlist, above every
+    # deny path, as on the IPv4 side.
+    _run($IP6TABLES, '-A', $CHAIN6_IN, '-j', $CHAIN6_AALLOW_IN);
 
     # Forged source addresses, after the allowlist for the same reason as on
     # the IPv4 side: an administrator who has deliberately allowed a unique
@@ -2596,6 +2621,10 @@ sub _build_rules6 {
              '-m', 'set', '--match-set', $SET_TEMP6, 'src', '-j', $logdrop);
     }
     _run($IP6TABLES, '-A', $CHAIN6_IN, '-j', $CHAIN6_DENY);
+
+    # Inbound advanced denies sit below every allow and above the port rules, the
+    # same position they take on the IPv4 side.
+    _run($IP6TABLES, '-A', $CHAIN6_IN, '-j', $CHAIN6_ADENY_IN);
 
     # External block lists, below the allowlist as on the IPv4 side.
     $class->_apply_blocklist_rules($config, 'inet6');
@@ -3241,6 +3270,29 @@ sub _apply_advanced_filter {
     # not what the kernel rejected, and counting both would report one
     # bad line twice.
     _run(@cmd);
+
+    # A filter with no IPv4 source is family-agnostic - it selects on protocol
+    # and ports alone - so it is emitted into the IPv6 chains as well when IPv6
+    # is being filtered. Without this a source-less deny such as "tcp|in|d=22"
+    # closed the port on IPv4 and left it open on IPv6, which is the opposite of
+    # what the guide says that line does, and on a dual-stack host the port stays
+    # reachable over IPv6. A filter that names an IPv4 source cannot apply to
+    # IPv6 and stays IPv4-only.
+    if (!defined $sip && $IPV6 && $IP6TABLES) {
+        my $chain6 = ($kind eq 'allow')
+            ? ($direction eq 'in' ? $CHAIN6_AALLOW_IN : $CHAIN6_AALLOW_OUT)
+            : ($direction eq 'in' ? $CHAIN6_ADENY_IN  : $CHAIN6_ADENY_OUT);
+        # The v6 deny chain always ends in a drop, whether or not logging is on,
+        # so it is a valid target for a deny in either case.
+        my $target6 = ($kind eq 'allow') ? 'ACCEPT' : $CHAIN6_LOGDROP;
+
+        my @cmd6 = ($IP6TABLES, '-A', $chain6, '-p', $proto);
+        push @cmd6, '--sport', $sport if $sport;
+        push @cmd6, '--dport', $dport if $dport;
+        push @cmd6, '-j',      $target6;
+        _run(@cmd6);
+    }
+
     return 1;
 }
 

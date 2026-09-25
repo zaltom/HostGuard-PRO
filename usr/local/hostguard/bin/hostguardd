@@ -668,7 +668,7 @@ sub read_logs {
 sub process_line {
     my ($line, $file) = @_;
 
-    my ($service, $ip) = HGDetect->match_failure($line, \%config);
+    my ($service, $ip) = HGDetect->match_failure($line, \%config, $file);
     if (defined $service) {
         record_failure($ip, $service, $line) if _actionable($ip);
         return;
